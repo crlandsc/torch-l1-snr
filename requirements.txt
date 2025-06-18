@@ -1,0 +1,6 @@
+# Core dependencies
+torch
+torchaudio
+
+# For development and testing
+pytest 
