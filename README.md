@@ -1,6 +1,9 @@
+![torch-l1-snr-logo](images/logo-01.png)
+<!-- (https://raw.githubusercontent.com/crlandsc/torch-log-wmse/main/images/logo.png) -->
+
 [![LICENSE](https://img.shields.io/github/license/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/stargazers)
 
-# torch-l1snr
+# torch-l1-snr
 
 A PyTorch implementation of L1-based Signal-to-Noise Ratio (SNR) loss functions for audio source separation. This package provides implementations and novel extensions based on concepts from recent academic papers, offering flexible and robust loss functions that can be easily integrated into any PyTorch-based audio separation pipeline.
 
@@ -39,6 +42,10 @@ pip install -e .
 
 - [PyTorch](https://pytorch.org/)
 - [torchaudio](https://pytorch.org/audio/stable/index.html)
+
+## Supported Tensor Shapes
+
+All loss functions in this package (`L1SNRLoss`, `L1SNRDBLoss`, `STFTL1SNRDBLoss`, and `MultiL1SNRDBLoss`) accept standard audio tensors of shape `(batch, samples)` or `(batch, channels, samples)`. For 3D tensors, the channel and sample dimensions are flattened before the time-domain losses are calculated. For the spectrogram-domain loss, a separate STFT is computed for each channel.
 
 ## Usage
 
@@ -86,44 +93,27 @@ loss.backward()
 print(f"STFTL1SNRDBLoss: {loss.item()}")
 ```
 
-### Example: `StemMultiL1SNRDBLoss` for Source Separation
+### Example: `MultiL1SNRDBLoss` for a Combined Time+Spectrogram Loss
 
-This is a flexible wrapper for multi-stem, multi-domain loss calculation.
+This loss combines the time-domain and spectrogram-domain losses into a single, weighted objective function.
 
 ```python
 import torch
-from torch_l1snr import StemMultiL1SNRDBLoss
+from torch_l1snr import MultiL1SNRDBLoss
 
-# Dummy data for a 4-stem source separation model (e.g., drums, bass, vocals, other)
-# Shape: (batch, stems, channels, samples)
-estimates = torch.randn(2, 4, 2, 44100) # Batch of 2
-actuals = torch.randn(2, 4, 2, 44100)
+# Create dummy audio signals
+# Shape: (batch, channels, samples)
+estimates = torch.randn(2, 2, 44100) # Batch of 2, stereo
+actuals = torch.randn(2, 2, 44100)
 
-# --- Configuration 1: Loss for the 'vocals' stem (e.g., index 2) ---
-vocals_loss_fn = StemMultiL1SNRDBLoss(
-    name="vocals_loss",
-    stem_dimension=2,         # Apply loss only on the 3rd stem
+# --- Configuration ---
+loss_fn = MultiL1SNRDBLoss(
     weight=1.0,               # Overall weight for this loss
     spec_weight=0.7,          # 70% spectrogram loss, 30% time-domain loss
-    l1_weight=0.05,           # Use 5% L1, 95% L1SNR+Reg
+    l1_weight=0.1,           # Use 10% L1, 90% L1SNR+Reg
 )
-vocals_loss = vocals_loss_fn(estimates, actuals)
-print(f"Vocals Loss: {vocals_loss.item()}")
-
-
-# --- Configuration 2: A simple L1 loss on the 'drums' stem (e.g., index 0) ---
-drums_loss_fn = StemMultiL1SNRDBLoss(
-    name="drums_loss",
-    stem_dimension=0,
-    l1_weight=1.0,            # This makes it a pure L1 loss
-    spec_weight=0.5,          # Time and spec domain L1 losses are averaged
-)
-drums_loss = drums_loss_fn(estimates, actuals)
-print(f"Drums L1 Loss: {drums_loss.item()}")
-
-# In a training loop, you would sum the losses
-# total_loss = vocals_loss + drums_loss
-# total_loss.backward()
+loss = loss_fn(estimates, actuals)
+print(f"Multi-domain Loss: {loss.item()}")
 ```
 
 ## Motivation
@@ -170,8 +160,6 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
-
-Thanks to [WhiteBalance](https://www.whitebalance.co/) for backing this project.
 
 The loss functions implemented here are based on the work of the authors of the referenced papers.
 
