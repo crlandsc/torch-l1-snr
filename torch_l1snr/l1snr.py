@@ -62,13 +62,17 @@ class L1SNRLoss(nn.Module):
         """
         Args:
             estimates (torch.Tensor): Estimated signals.
-                                      Shape: `(batch_size, num_samples)`
+                                      Shape: `(batch, samples)` or `(batch, channels, samples)`
             actuals (torch.Tensor): Ground truth signals.
-                                    Shape: `(batch_size, num_samples)`
+                                    Shape: `(batch, samples)` or `(batch, channels, samples)`
         
         Returns:
             torch.Tensor: The calculated L1 SNR loss (scalar).
         """
+        # Reshape to (batch, -1) to handle both 2D and 3D inputs uniformly
+        estimates = estimates.reshape(estimates.shape[0], -1)
+        actuals = actuals.reshape(actuals.shape[0], -1)
+
         # Shape: [batch_size]
         l1_error = torch.mean(torch.abs(estimates - actuals), dim=-1)
         # Shape: [batch_size]
@@ -155,22 +159,26 @@ class L1SNRDBLoss(nn.Module):
         """
         Args:
             estimates (torch.Tensor): Estimated signals.
-                                      Shape: `(batch_size, num_samples)`
+                                      Shape: `(batch, samples)` or `(batch, channels, samples)`
             actuals (torch.Tensor): Ground truth signals.
-                                    Shape: `(batch_size, num_samples)`
+                                    Shape: `(batch, samples)` or `(batch, channels, samples)`
         
         Returns:
             torch.Tensor: The calculated loss (scalar).
         """
-        # Efficient path for pure L1 loss
+        # Efficient path for pure L1 loss, which handles shapes correctly.
         if self.l1_loss is not None:
             return self.l1_loss(estimates, actuals) * self.l1_scale
         
+        # Reshape to (batch, -1) to handle both 2D and 3D inputs uniformly
+        estimates_flat = estimates.reshape(estimates.shape[0], -1)
+        actuals_flat = actuals.reshape(actuals.shape[0], -1)
+
         # --- L1SNR Component ---
         # Shape: [batch_size]
-        l1_error = torch.mean(torch.abs(estimates - actuals), dim=-1)
+        l1_error = torch.mean(torch.abs(estimates_flat - actuals_flat), dim=-1)
         # Shape: [batch_size]
-        l1_true = torch.mean(torch.abs(actuals), dim=-1)
+        l1_true = torch.mean(torch.abs(actuals_flat), dim=-1)
         # Shape: [batch_size]
         snr = 20.0 * torch.log10((l1_true + self.l1snr_eps) / (l1_error + self.l1snr_eps))
         snr_loss = -torch.mean(snr)
@@ -335,9 +343,9 @@ class STFTL1SNRDBLoss(nn.Module):
         """
         Args:
             estimates (torch.Tensor): Estimated signals.
-                                      Shape: `(batch_size, num_samples)`
+                                      Shape: `(batch, samples)` or `(batch, channels, samples)`
             actuals (torch.Tensor): Ground truth signals.
-                                    Shape: `(batch_size, num_samples)`
+                                    Shape: `(batch, samples)` or `(batch, channels, samples)`
         Returns:
             torch.Tensor: The calculated multi-resolution spectral loss (scalar).
         """
@@ -388,23 +396,16 @@ class STFTL1SNRDBLoss(nn.Module):
 
 class MultiL1SNRDBLoss(nn.Module):
     """
-    A modular loss that combines time-domain and spectrogram-domain L1SNRDB losses.
-    This loss is designed for audio source separation and can be configured to process
-    either all stems jointly or a single specified stem.
+    A modular loss that combines time-domain and spectrogram-domain L1SNRDB losses
+    for a single audio source.
 
     The final loss is a weighted sum of the time-domain and spectrogram-domain losses:
     Loss = weight * [(1 - spec_weight) * time_loss + spec_weight * spec_loss]
 
     Each domain's loss is a combination of L1SNR, adaptive level-matching regularization,
-    and an optional L1 component, controlled by the `l1_weight` parameter. Setting
-    `l1_weight=1.0` efficiently computes only L1 loss in both domains.
+    and an optional L1 component, controlled by the `l1_weight` parameter.
 
     Args:
-        name (str): The name identifier for the loss instance.
-        stem_dimension (Union[int, None]): The specific stem dimension to apply the loss on.
-            If None, the loss is applied to all stems jointly after reshaping.
-            The input tensor is expected to be `(batch, stems, channels, samples)`.
-            This will be flattened to `(batch, stems * channels * samples)` for loss calculation.
         weight (float): The overall weight multiplier for the final combined loss.
         spec_weight (float): The weight for the spectrogram domain loss relative to the
             time domain loss. `(0.0 <= spec_weight <= 1.0)`.
@@ -423,8 +424,6 @@ class MultiL1SNRDBLoss(nn.Module):
     """
     def __init__(
         self, 
-        name: str,
-        stem_dimension: Optional[int] = None, 
         weight: float = 1.0,
         spec_weight: float = 0.5,
         l1_weight: float = 0.0,
@@ -437,8 +436,6 @@ class MultiL1SNRDBLoss(nn.Module):
         **kwargs
     ):
         super().__init__()
-        self.name = name
-        self.stem_dimension = stem_dimension
         self.weight = weight
         self.spec_weight = spec_weight
         
@@ -472,34 +469,18 @@ class MultiL1SNRDBLoss(nn.Module):
 
         Args:
             estimates (torch.Tensor): Model output predictions.
-                                      Shape: `(batch, stems, channels, samples)`
+                                      Shape: `(batch, samples)` or `(batch, channels, samples)`
             actuals (torch.Tensor): Ground truth targets.
-                                    Shape: `(batch, stems, channels, samples)`
+                                    Shape: `(batch, samples)` or `(batch, channels, samples)`
         
         Returns:
             torch.Tensor: The final combined weighted loss (scalar).
         """
-        batch_size = estimates.shape[0]
-
-        # Select a specific stem or flatten all stems for processing
-        if self.stem_dimension is not None:
-            # Shape: [batch, channels, samples] 
-            est_source_unflat = estimates[:, self.stem_dimension, ...]
-            act_source_unflat = actuals[:, self.stem_dimension, ...]
-        else:
-            # Shape: [batch, stems, channels, samples] 
-            est_source_unflat = estimates
-            act_source_unflat = actuals
-
-        # Reshape to (batch, -1) for loss components
-        est_source = est_source_unflat.reshape(batch_size, -1)
-        act_source = act_source_unflat.reshape(batch_size, -1)
-
         # Compute time-domain loss
-        time_loss = self.time_loss(est_source, act_source)
+        time_loss = self.time_loss(estimates, actuals)
         
         # Compute spectrogram-domain loss
-        spec_loss = self.spec_loss(est_source, act_source)
+        spec_loss = self.spec_loss(estimates, actuals)
         
         # Combine with weighting
         combined_loss = (1 - self.spec_weight) * time_loss + self.spec_weight * spec_loss
