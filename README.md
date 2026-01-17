@@ -4,8 +4,6 @@
 
 [![LICENSE](https://img.shields.io/github/license/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/stargazers)
 
-# torch-l1-snr
-
 A PyTorch implementation of L1-based Signal-to-Noise Ratio (SNR) loss functions for audio source separation. This package provides implementations and novel extensions based on concepts from recent academic papers, offering flexible and robust loss functions that can be easily integrated into any PyTorch-based audio separation pipeline.
 
 The core `L1SNRLoss` is based on the loss function described in [1], while `L1SNRDBLoss` and `STFTL1SNRDBLoss` are extensions of the adaptive level-matching regularization technique proposed in [2].
@@ -20,10 +18,7 @@ The core `L1SNRLoss` is based on the loss function described in [1], while `L1SN
 
 ## Installation
 
-<!-- Add PyPI badges once the package is published -->
-<!-- [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-l1snr)](https://pypi.org/project/torch-l1snr/) -->
-<!-- [![PyPI - Version](https://img.shields.io/pypi/v/torch-l1snr)](https://pypi.org/project/torch-l1snr/) -->
-<!-- [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-l1snr)](https://pypi.org/project/torch-l1snr/) -->
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/) [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/)
 
 You can install the package directly from GitHub:
 
@@ -62,9 +57,13 @@ from torch_l1snr import L1SNRDBLoss
 estimates = torch.randn(4, 32000)  # Batch of 4, 32000 samples
 actuals = torch.randn(4, 32000)
 
-# Initialize the loss function
-# l1_weight=0.1 blends L1SNR with 10% L1 loss
-loss_fn = L1SNRDBLoss(l1_weight=0.1)
+# Initialize the loss function with regularization enabled
+# l1_weight=0.1 blends L1SNR+Regularization with 10% L1 loss
+loss_fn = L1SNRDBLoss(
+    name="l1_snr_db_loss",
+    use_regularization=True,  # Enable adaptive level-matching regularization
+    l1_weight=0.1             # 10% L1 loss, 90% L1SNR + regularization
+)
 
 # Calculate loss
 loss = loss_fn(estimates, actuals)
@@ -84,8 +83,11 @@ estimates = torch.randn(4, 32000)
 actuals = torch.randn(4, 32000)
 
 # Initialize the loss function
-# Uses multiple STFT resolutions by default
-loss_fn = STFTL1SNRDBLoss(l1_weight=0.0) # Pure L1SNR + Regularization
+# Uses multiple STFT resolutions by default: [512, 1024, 2048] FFT sizes
+loss_fn = STFTL1SNRDBLoss(
+    name="stft_l1_snr_db_loss",
+    l1_weight=0.0              # Pure L1SNR (no regularization, no L1)
+)
 
 # Calculate loss
 loss = loss_fn(estimates, actuals)
@@ -109,9 +111,12 @@ actuals = torch.randn(2, 2, 44100)
 
 # --- Configuration ---
 loss_fn = MultiL1SNRDBLoss(
-    weight=1.0,               # Overall weight for this loss
-    spec_weight=0.7,          # 70% spectrogram loss, 30% time-domain loss
-    l1_weight=0.1,           # Use 10% L1, 90% L1SNR+Reg
+    name="multi_l1_snr_db_loss",
+    weight=1.0,                    # Overall weight for this loss
+    spec_weight=0.6,               # 60% spectrogram loss, 40% time-domain loss
+    l1_weight=0.1,                 # Use 10% L1, 90% L1SNR+Reg in both domains
+    use_time_regularization=True,  # Enable regularization in time domain
+    use_spec_regularization=False  # Disable regularization in spec domain
 )
 loss = loss_fn(estimates, actuals)
 print(f"Multi-domain Loss: {loss.item()}")
