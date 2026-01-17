@@ -1,16 +1,20 @@
-# Separate This, and All of these Things Around It: Music Source Separation via Hyperellipsoidal Queries
-# Karn N. Watcharasupat, Alexander Lerch
-# arXiv:2501.16171
-
-# A Generalized Bandsplit Neural Network for Cinematic Audio Source Separation
-# Karn N. Watcharasupat, Chih-Wei Wu, Yiwei Ding, Iroro Orife, Aaron J. Hipple, Phillip A. Williams, Scott Kramer, Alexander Lerch, William Wolcott
-# IEEE Open Journal of Signal Processing, 2023
-# arXiv:2309.02539
-
-# A Stem-Agnostic Single-Decoder System for Music Source Separation Beyond Four Stems
-# Karn N. Watcharasupat, Alexander Lerch
-# Proceedings of the 25th International Society for Music Information Retrieval Conference, 2024
-# arXiv:2406.18747
+# PyTorch implementation of L1SNR loss functions for audio source separation
+# https://github.com/crlandsc/torch-l1-snr
+# Copyright (c) 2026 crlandsc
+# MIT License
+#
+# This implementation is based on and extends the loss functions described in:
+# [1] "Separate This, and All of these Things Around It: Music Source Separation via Hyperellipsoidal Queries"
+#     Karn N. Watcharasupat, Alexander Lerch
+#     arXiv:2501.16171
+# [2] "A Generalized Bandsplit Neural Network for Cinematic Audio Source Separation"
+#     Karn N. Watcharasupat, Chih-Wei Wu, Yiwei Ding, Iroro Orife, Aaron J. Hipple, Phillip A. Williams, Scott Kramer, Alexander Lerch, William Wolcott
+#     IEEE Open Journal of Signal Processing, 2023
+#     arXiv:2309.02539
+# [3] "A Stem-Agnostic Single-Decoder System for Music Source Separation Beyond Four Stems"
+#     Karn N. Watcharasupat, Alexander Lerch
+#     Proceedings of the 25th International Society for Music Information Retrieval Conference, 2024
+#     arXiv:2406.18747
 
 import torch
 import torch.nn as nn
