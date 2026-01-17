@@ -34,8 +34,8 @@ def dbrms(x, eps=1e-8):
 
 class L1SNRLoss(torch.nn.Module):
     """
-    Implements the L1 Signal-to-Noise Ratio (SNR) loss for a specific stem or all stems,
-    with optional weighted L1 loss component to balance "all-or-nothing" behavior.
+    Implements the L1 Signal-to-Noise Ratio (SNR) loss with optional weighted L1 loss 
+    component to balance "all-or-nothing" behavior.
 
     Paper-aligned D1(ŷ; y) form:
       D1 = 10 * log10( (||ŷ - y||_1 + eps) / (||y||_1 + eps) )
@@ -43,6 +43,13 @@ class L1SNRLoss(torch.nn.Module):
 
     When l1_weight > 0, the loss combines L1SNR with scaled L1:
       loss = (1 - l1_weight) * L1SNR_loss + l1_weight * L1_auto_scaled
+
+    Input Shape:
+        Accepts waveform tensors (time-domain audio) of any shape as long as they are batch-first.
+        Recommended shapes:
+        - [batch, time] for single-source audio
+        - [batch, num_sources, time] for multi-source audio
+        - [batch, num_sources, channels, time] for multi-channel multi-source audio
 
     Attributes:
         name (str): Name identifier for the loss.
@@ -135,6 +142,13 @@ class L1SNRDBLoss(torch.nn.Module):
     When l1_weight=1.0, this loss efficiently switches to a pure L1 loss calculation,
     bypassing all SNR and regularization computations for standard L1 behavior.
     This is useful when you want to avoid the "all-or-nothing" behavior of the SNR-style loss.
+    
+    Input Shape:
+        Accepts waveform tensors (time-domain audio) of any shape as long as they are batch-first.
+        Recommended shapes:
+        - [batch, time] for single-source audio
+        - [batch, num_sources, time] for multi-source audio
+        - [batch, num_sources, channels, time] for multi-channel multi-source audio
     
     Attributes:
         name (str): The name identifier for the loss.
@@ -272,10 +286,15 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     spectrogram domain, bypassing all SNR and regularization computations for standard L1 behavior.
     This is useful when you want to avoid the "all-or-nothing" behavior of the SNR-style loss.
     
+    Input Shape:
+        Accepts waveform tensors (time-domain audio) of any shape as long as they are batch-first
+        and time-last. Recommended shapes:
+        - [batch, time] for single-source audio
+        - [batch, num_sources, time] for multi-source audio
+        - [batch, num_sources, channels, time] for multi-channel multi-source audio
+    
     Attributes:
         name (str): The name identifier for the loss.
-        stem_dimension (Union[int, None]): The specific stem dimension to apply the loss on.
-            If None, applies the loss across all stems.
         weight (float): The overall weight multiplier for the loss.
         lambda0 (float): Minimum regularization weight (λ_min).
         delta_lambda (float): Range of extra weight for regularization (Δλ).
@@ -297,7 +316,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     def __init__(
         self, 
         name, 
-        stem_dimension: Union[int, None] = None, 
         weight: float = 1.0,
         lambda0: float = 0.1,
         delta_lambda: float = 0.9,
@@ -315,7 +333,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     ):
         super().__init__()
         self.name = name
-        self.stem_dimension = stem_dimension
         self.weight = weight
         self.min_audio_length = min_audio_length
         
@@ -378,7 +395,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Fallback time-domain loss (used when audio is too short for TF processing)
         self.fallback_time_loss = L1SNRDBLoss(
             name=f"{name}_fallback_time",
-            stem_dimension=stem_dimension,
             weight=1.0,
             lambda0=self.lambda0,
             delta_lambda=self.delta_lambda,
@@ -516,14 +532,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             estimates = torch.nan_to_num(estimates, nan=0.0, posinf=1.0, neginf=-1.0)
             actuals = torch.nan_to_num(actuals, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # Extract the right tensors based on stem_dimension
-        if self.stem_dimension is not None:
-            est_source = estimates[:, self.stem_dimension, ...].reshape(batch_size, -1, estimates.shape[-1])
-            act_source = actuals[:, self.stem_dimension, ...].reshape(batch_size, -1, actuals.shape[-1])
-        else:
-            # If no specific stem, reshape to process all stems together
-            est_source = estimates.reshape(batch_size, -1, estimates.shape[-1])
-            act_source = actuals.reshape(batch_size, -1, actuals.shape[-1])
+        est_source = estimates.reshape(batch_size, -1, estimates.shape[-1])
+        act_source = actuals.reshape(batch_size, -1, actuals.shape[-1])
         
         # Validate audio length
         audio_length = est_source.shape[-1]
@@ -642,10 +652,15 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     The regularization components use adaptive weighting based on level differences
     between estimated and target signals, with weighting controlled by lambda0 and delta_lambda.
     
+    Input Shape:
+        Accepts waveform tensors (time-domain audio) of any shape as long as they are batch-first
+        and time-last. Recommended shapes:
+        - [batch, time] for single-source audio
+        - [batch, num_sources, time] for multi-source audio
+        - [batch, num_sources, channels, time] for multi-channel multi-source audio
+    
     Attributes:
         name (str): The name identifier for the loss.
-        stem_dimension (Union[int, None]): The specific stem dimension to apply the loss on.
-            If None, applies the loss across all stems.
         weight (float): The overall weight multiplier for the loss.
         spec_weight (float): The weight for spectrogram domain loss relative to time domain.
             Default 0.5 (equal weighting). Set higher to emphasize spectral accuracy.
@@ -662,7 +677,6 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     def __init__(
         self, 
         name, 
-        stem_dimension: Union[int, None] = None, 
         weight: float = 1.0,
         spec_weight: float = 0.5,  # Balance between time and frequency domain
         # L1 component parameters
@@ -691,7 +705,6 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     ):
         super().__init__()
         self.name = name
-        self.stem_dimension = stem_dimension
         self.weight = weight
         self.spec_weight = spec_weight
         
@@ -704,7 +717,6 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         # Set up default parameters
         default_time_params = {
             "name": f"{name}_time",
-            "stem_dimension": stem_dimension,
             "weight": 1.0,  # Will be scaled by the combined loss
             "lambda0": lambda0,
             "delta_lambda": delta_lambda,
@@ -717,7 +729,6 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         
         default_spec_params = {
             "name": f"{name}_spec",
-            "stem_dimension": stem_dimension,
             "weight": 1.0,  # Will be scaled by the combined loss
             "lambda0": lambda0,
             "delta_lambda": delta_lambda,
@@ -754,8 +765,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         Forward pass to compute the combined multi-domain loss.
         
         Args:
-            estimates: Model output predictions, shape [batch, stems, channels, samples]
-            actuals: Ground truth targets, shape [batch, stems, channels, samples]
+            estimates: Model output predictions, shape [batch, ...] (batch-first, ..., time-last)
+            actuals: Ground truth targets, shape [batch, ...] (batch-first, ..., time-last)
             *args, **kwargs: Additional arguments passed to sub-losses
             
         Returns:
