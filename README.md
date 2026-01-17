@@ -1,4 +1,4 @@
-![torch-l1-snr-logo](https://raw.githubusercontent.com/crlandsc/torch-l1-snr/main/images/logo.png) -->
+![torch-l1-snr-logo](https://raw.githubusercontent.com/crlandsc/torch-l1-snr/main/images/logo.png)
 
 # NOTE: Repo is currently a work-in-progress and not ready for installation & use.
 
