@@ -1,0 +1,6 @@
+torch
+torchaudio
+numpy>=1.21.0
+
+# For development and testing
+pytest
