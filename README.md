@@ -1,5 +1,6 @@
-![torch-l1-snr-logo](images/logo.png)
-<!-- (https://raw.githubusercontent.com/crlandsc/torch-l1-snr/main/images/logo.png) -->
+![torch-l1-snr-logo](https://raw.githubusercontent.com/crlandsc/torch-l1-snr/main/images/logo.png) -->
+
+# NOTE: Repo is currently a work-in-progress and not ready for installation & use.
 
 [![LICENSE](https://img.shields.io/github/license/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/blob/main/LICENSE) [![GitHub Repo stars](https://img.shields.io/github/stars/crlandsc/torch-l1snr)](https://github.com/crlandsc/torch-l1snr/stargazers)
 
