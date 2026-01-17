@@ -134,7 +134,8 @@ class L1SNRDBLoss(torch.nn.Module):
     3. Optional L1 loss: mean(l1_error)
     
     The complete loss is structured as:
-    total_loss = (1-l1_weight) * (l1snr_loss + (1-l1_weight)*reg_loss) + l1_weight * (l1_loss)
+    When l1_weight < 1.0: total_loss = l1snr_loss + (1-l1_weight) * mean(reg_loss)
+    When l1_weight = 1.0: total_loss = l1_loss (pure L1, bypassing all other computations)
     
     The adaptive weighting λ for regularization increases when loud parts of a stem aren't
     reconstructed properly, helping balance between quality and level preservation.
@@ -280,7 +281,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     characteristics. The loss averages results across all valid STFT resolutions.
     
     The complete loss structure is similar to L1SNRDBLoss:
-    total_loss = (1-l1_weight) * (l1snr_loss + (1-l1_weight)*reg_loss) + l1_weight * (l1_loss)
+    When l1_weight < 1.0: total_loss = l1snr_loss + (1-l1_weight) * spec_reg_coef * mean(reg_loss)
+    When l1_weight = 1.0: total_loss = l1_loss (pure L1 in spectrogram domain, bypassing all other computations)
     
     When l1_weight=1.0, this loss efficiently switches to a pure L1 loss calculation in the
     spectrogram domain, bypassing all SNR and regularization computations for standard L1 behavior.
@@ -633,17 +635,12 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     - L1SNRDBLoss for time domain processing
     - STFTL1SNRDBLoss for spectrogram domain processing
     
-    The loss is structured as:
-    Loss = weight * [(1-spec_weight) * time_loss + spec_weight * spec_loss], where:
+    The loss combines time-domain and spectrogram-domain losses:
+    Loss = weight * [(1-spec_weight) * time_loss + spec_weight * spec_loss]
     
-    - time_loss: Combines L1SNR, regularization, and optional L1 in time domain
-      - When l1_weight=0: time_loss = L1SNR_time + regularization_time
-      - When l1_weight>0 and <1: time_loss = (1-l1_weight)*(L1SNR_time + (1-l1_weight)*regularization_time) 
-                                           + l1_weight*(L1_time)
-      - When l1_weight=1.0: time_loss = L1 loss only (all other calculations bypassed)
-    
-    - spec_loss: Combines L1SNR, regularization, and optional L1 in spectrogram domain
-      - Similar structure to time_loss but with spectral components and scaling
+    Where time_loss and spec_loss are computed by L1SNRDBLoss and STFTL1SNRDBLoss respectively,
+    each handling their own L1SNR, regularization, and optional L1 components as described
+    in their individual docstrings.
     
     When l1_weight=1.0, this loss efficiently switches to a pure L1 loss calculation in both
     domains, bypassing all SNR and regularization computations for standard L1 behavior.
