@@ -20,7 +20,13 @@ The core `L1SNRLoss` is based on the loss function described in [1], while `L1SN
 
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/) [![PyPI - Version](https://img.shields.io/pypi/v/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/) [![Number of downloads from PyPI per month](https://img.shields.io/pypi/dm/torch-l1-snr)](https://pypi.org/project/torch-l1-snr/)
 
-You can install the package directly from GitHub:
+## Install from PyPI
+
+```bash
+pip install torch-l1-snr
+```
+
+## Install from GitHub
 
 ```bash
 pip install git+https://github.com/crlandsc/torch-l1snr.git
