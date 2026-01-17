@@ -1,6 +1,3 @@
-# Core dependencies
 torch
 torchaudio
-
-# For development and testing
-pytest 
+numpy>=1.21.0
