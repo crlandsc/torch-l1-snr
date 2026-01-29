@@ -64,6 +64,9 @@ venv.bak/
 # IDEs
 .vscode/
 .idea/
+.cursor/
+.claude/
+CLAUDE.md
 
 # Local config
 local_settings.py
