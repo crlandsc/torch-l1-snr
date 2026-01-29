@@ -13,3 +13,5 @@ __all__ = [
     "STFTL1SNRDBLoss",
     "MultiL1SNRDBLoss",
 ] 
+
+__version__ = "0.0.5"
