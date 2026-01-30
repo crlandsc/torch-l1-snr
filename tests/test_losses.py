@@ -1,7 +1,7 @@
 import torch
 import pytest
 from typing import Optional
-from torch_l1snr import (
+from torch_l1_snr import (
     dbrms,
     L1SNRLoss,
     L1SNRDBLoss,
