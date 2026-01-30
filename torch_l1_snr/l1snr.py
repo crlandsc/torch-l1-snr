@@ -16,6 +16,8 @@
 #     Proceedings of the 25th International Society for Music Information Retrieval Conference, 2024
 #     arXiv:2406.18747
 
+import warnings
+
 import torch
 import torch.nn as nn
 from torchaudio.transforms import Spectrogram
@@ -106,20 +108,6 @@ class L1SNRLoss(torch.nn.Module):
         # w-independent scaling to match typical gradient magnitudes
         scale_time = c * inv_mean
         l1_term = torch.mean(l1_error) * scale_time
-
-        if getattr(self, "balance_per_sample", False):
-            # per-sample w-independent scaling
-            bal = c / (l1_error.detach() + self.eps)
-            l1_term = torch.mean(l1_error * bal)
-
-        if getattr(self, "debug_balance", False):
-            g_d1 = (1.0 - w) * c * inv_mean
-            if getattr(self, "balance_per_sample", False):
-                g_l1 = w * torch.mean(c / (l1_error.detach() + self.eps))
-            else:
-                g_l1 = w * c * inv_mean
-            ratio = (g_l1 / (g_d1 + 1e-12)).item()
-            setattr(self, "last_balance_ratio", ratio)
 
         loss = (1.0 - w) * l1snr_loss + w * l1_term
         return loss * self.weight
@@ -464,11 +452,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             scale_spec = 2.0 * c * inv_mean_comp
             l1_term = 0.5 * (torch.mean(err_re) + torch.mean(err_im)) * scale_spec
 
-            if getattr(self, "balance_per_sample", False):
-                bal_re = c / (err_re.detach() + self.l1snr_eps)
-                bal_im = c / (err_im.detach() + self.l1snr_eps)
-                l1_term = 0.5 * (torch.mean(err_re * bal_re) + torch.mean(err_im * bal_im))
-
             loss = (1.0 - w) * d1_sum + w * l1_term
             return loss
         elif w >= 1.0:
@@ -563,8 +546,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                     est_spec = transform(est_source)
                     act_spec = transform(act_source)
                 except RuntimeError as e:
-                    print(f"Error computing spectrogram for resolution {i}: {e}")
-                    print(f"Parameters: n_fft={self.n_ffts[i]}, hop_length={self.hop_lengths[i]}, win_length={self.win_lengths[i]}")
+                    warnings.warn(
+                        f"Error computing spectrogram for resolution {i}: {e}. "
+                        f"Parameters: n_fft={self.n_ffts[i]}, hop_length={self.hop_lengths[i]}, win_length={self.win_lengths[i]}"
+                    )
                     continue
                 
                 # Ensure same (B, C, F, T); crop only (F, T) if needed
@@ -578,7 +563,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                 try:
                     spec_loss = self._compute_complex_spec_l1snr_loss(est_spec, act_spec)
                 except RuntimeError as e:
-                    print(f"Error computing complex spectral loss for resolution {i}: {e}")
+                    warnings.warn(f"Error computing complex spectral loss for resolution {i}: {e}")
                     continue
                 
                 # Check for numerical issues
@@ -599,19 +584,19 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                         # Accumulate regularization loss
                         total_spec_reg_loss += spec_reg_loss
                     except RuntimeError as e:
-                        print(f"Error computing spectral level-matching for resolution {i}: {e}")
+                        warnings.warn(f"Error computing spectral level-matching for resolution {i}: {e}")
                 
                 # Accumulate loss
                 total_spec_loss += spec_loss
                 valid_transforms += 1
                                 
             except RuntimeError as e:
-                print(f"Runtime error in spectrogram transform {i}: {e}")
+                warnings.warn(f"Runtime error in spectrogram transform {i}: {e}")
                 continue
         
         # If all transforms failed, return zero loss
         if valid_transforms == 0:
-            print("Warning: All spectrogram transforms failed. Returning zero loss.")
+            warnings.warn("All spectrogram transforms failed. Returning zero loss.")
             return torch.tensor(0.0, device=device)
         
         # Average losses across valid transforms
