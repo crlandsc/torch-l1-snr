@@ -209,7 +209,7 @@ While this can potentially reduce the "cleanliness" of separations and slightly 
 
 The implementation is optimized for efficiency: if `l1_weight` is `0.0` or `1.0`, the unused loss component is not computed, saving computational resources.
 
-**Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation automatically scales the L1 component to approximately match the gradient magnitudes of the L1SNR component. This helps maintain stable training without manual tuning.
+**Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation automatically scales the L1 component to approximately match gradient magnitudes while preserving distinct gradient behaviors. This helps maintain stable training without manual tuning.
 
 ## Limitations
 
