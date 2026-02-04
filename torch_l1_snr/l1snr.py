@@ -104,9 +104,10 @@ class L1SNRLoss(torch.nn.Module):
         l1snr_loss = torch.mean(d1)
 
         c = 10.0 / math.log(10.0)
-        inv_mean = torch.mean(1.0 / (l1_error.detach() + self.eps))
-        # w-independent scaling to match typical gradient magnitudes
-        scale_time = c * inv_mean
+        # Scale by reference signal magnitude (not error) to preserve gradient distinction
+        # L1SNR has inverse-error gradients; L1 should have uniform gradients
+        inv_ref_mean = torch.mean(1.0 / (l1_true.detach() + self.eps))
+        scale_time = c * inv_ref_mean
         l1_term = torch.mean(l1_error) * scale_time
 
         loss = (1.0 - w) * l1snr_loss + w * l1_term
@@ -446,10 +447,11 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         w = float(self.l1_weight)
         if 0.0 < w < 1.0:
             c = 10.0 / math.log(10.0)
-            inv_mean_comp = torch.mean(0.5 * (1.0 / (err_re.detach() + self.l1snr_eps) +
-                                              1.0 / (err_im.detach() + self.l1snr_eps)))
-            # w-independent scaling to match typical gradient magnitudes (factor 2.0 for Re/Im symmetry)
-            scale_spec = 2.0 * c * inv_mean_comp
+            # Scale by reference signal magnitude (not error) to preserve gradient distinction
+            # L1SNR has inverse-error gradients; L1 should have uniform gradients
+            inv_ref_mean_comp = torch.mean(0.5 * (1.0 / (ref_re.detach() + self.l1snr_eps) +
+                                                  1.0 / (ref_im.detach() + self.l1snr_eps)))
+            scale_spec = 2.0 * c * inv_ref_mean_comp
             l1_term = 0.5 * (torch.mean(err_re) + torch.mean(err_im)) * scale_spec
 
             loss = (1.0 - w) * d1_sum + w * l1_term
