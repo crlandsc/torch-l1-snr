@@ -542,4 +542,119 @@ def test_multi_wrapper_short_audio_4d():
     
     assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
     assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result) 
+    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+
+
+# --- Gradient Behavior Tests ---
+def test_gradient_distinction_l1snr_vs_l1():
+    """
+    Verify L1SNR and L1 have distinct gradient behaviors.
+    L1SNR: inverse-error scaling (larger updates for small errors)
+    L1: uniform gradients regardless of error magnitude
+    """
+    torch.manual_seed(42)
+
+    actuals = torch.tensor([[1.0] * 100, [1.0] * 100])
+    estimates = actuals.clone()
+    estimates[0] += 0.01  # small error
+    estimates[1] += 0.5   # large error
+
+    # Pure L1SNR (l1_weight=0)
+    est_snr = estimates.clone().requires_grad_(True)
+    loss_snr = L1SNRLoss("test", l1_weight=0.0)(est_snr, actuals)
+    loss_snr.backward()
+    ratio_snr = est_snr.grad[0].abs().mean() / est_snr.grad[1].abs().mean()
+
+    # Pure L1 (l1_weight=1)
+    est_l1 = estimates.clone().requires_grad_(True)
+    loss_l1 = L1SNRLoss("test", l1_weight=1.0)(est_l1, actuals)
+    loss_l1.backward()
+    ratio_l1 = est_l1.grad[0].abs().mean() / est_l1.grad[1].abs().mean()
+
+    # L1SNR: larger gradient for small error sample (ratio >> 1)
+    assert ratio_snr > 10.0, f"L1SNR gradient ratio should be >> 1, got {ratio_snr}"
+    # L1: uniform gradients (ratio ~ 1)
+    assert 0.9 < ratio_l1 < 1.1, f"L1 gradient ratio should be ~1, got {ratio_l1}"
+
+
+def test_l1_weight_interpolation():
+    """
+    Verify l1_weight actually affects gradient behavior.
+    Gradient ratio should decrease as l1_weight increases (from inverse-error toward uniform).
+    """
+    torch.manual_seed(42)
+
+    actuals = torch.tensor([[1.0] * 100, [1.0] * 100])
+    estimates = actuals.clone()
+    estimates[0] += 0.01  # small error
+    estimates[1] += 0.5   # large error
+
+    ratios = []
+    for w in [0.0, 0.5, 1.0]:
+        est = estimates.clone().requires_grad_(True)
+        loss = L1SNRLoss("test", l1_weight=w)(est, actuals)
+        loss.backward()
+        ratio = (est.grad[0].abs().mean() / est.grad[1].abs().mean()).item()
+        ratios.append(ratio)
+
+    # Gradient ratio should monotonically decrease as l1_weight increases
+    assert ratios[0] > ratios[1] > ratios[2], \
+        f"Gradient ratios should decrease with l1_weight: {ratios}"
+
+
+def test_stft_gradient_distinction():
+    """
+    Same gradient distinction test for STFTL1SNRDBLoss.
+    """
+    torch.manual_seed(42)
+
+    # Need longer audio for STFT
+    actuals = torch.tensor([[1.0] * 4096, [1.0] * 4096])
+    estimates = actuals.clone()
+    estimates[0] += 0.01  # small error
+    estimates[1] += 0.5   # large error
+
+    # Pure L1SNR (l1_weight=0)
+    est_snr = estimates.clone().requires_grad_(True)
+    loss_fn_snr = STFTL1SNRDBLoss("test", l1_weight=0.0, n_ffts=[512], hop_lengths=[128], win_lengths=[512])
+    loss_snr = loss_fn_snr(est_snr, actuals)
+    loss_snr.backward()
+    ratio_snr = est_snr.grad[0].abs().mean() / est_snr.grad[1].abs().mean()
+
+    # Pure L1 (l1_weight=1)
+    est_l1 = estimates.clone().requires_grad_(True)
+    loss_fn_l1 = STFTL1SNRDBLoss("test", l1_weight=1.0, n_ffts=[512], hop_lengths=[128], win_lengths=[512])
+    loss_l1 = loss_fn_l1(est_l1, actuals)
+    loss_l1.backward()
+    ratio_l1 = est_l1.grad[0].abs().mean() / est_l1.grad[1].abs().mean()
+
+    # STFT processing smooths out per-sample differences, so ratios are smaller
+    # Key check: L1SNR ratio > L1 ratio (gradient behaviors differ)
+    assert ratio_snr > ratio_l1, f"STFT L1SNR ratio ({ratio_snr}) should be > L1 ratio ({ratio_l1})"
+    # L1: more uniform gradients (ratio closer to 1)
+    assert ratio_l1 < ratio_snr, f"STFT L1 should have more uniform gradients"
+
+
+def test_stft_l1_weight_interpolation():
+    """
+    Verify l1_weight interpolation works for STFTL1SNRDBLoss.
+    """
+    torch.manual_seed(42)
+
+    actuals = torch.tensor([[1.0] * 4096, [1.0] * 4096])
+    estimates = actuals.clone()
+    estimates[0] += 0.01
+    estimates[1] += 0.5
+
+    ratios = []
+    for w in [0.0, 0.5, 1.0]:
+        est = estimates.clone().requires_grad_(True)
+        loss_fn = STFTL1SNRDBLoss("test", l1_weight=w, n_ffts=[512], hop_lengths=[128], win_lengths=[512])
+        loss = loss_fn(est, actuals)
+        loss.backward()
+        ratio = (est.grad[0].abs().mean() / est.grad[1].abs().mean()).item()
+        ratios.append(ratio)
+
+    # Gradient ratio should decrease as l1_weight increases
+    assert ratios[0] > ratios[1] > ratios[2], \
+        f"STFT gradient ratios should decrease with l1_weight: {ratios}"
