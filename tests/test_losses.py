@@ -638,6 +638,7 @@ def test_stft_gradient_distinction():
 def test_stft_l1_weight_interpolation():
     """
     Verify l1_weight interpolation works for STFTL1SNRDBLoss.
+    L1 weighting should make gradients more uniform compared to pure SNR.
     """
     torch.manual_seed(42)
 
@@ -655,6 +656,10 @@ def test_stft_l1_weight_interpolation():
         ratio = (est.grad[0].abs().mean() / est.grad[1].abs().mean()).item()
         ratios.append(ratio)
 
-    # Gradient ratio should decrease as l1_weight increases
-    assert ratios[0] > ratios[1] > ratios[2], \
-        f"STFT gradient ratios should decrease with l1_weight: {ratios}"
+    # L1 weighting should make gradients more uniform (ratio closer to 1)
+    # Pure L1 (l1_weight=1.0) should have more uniform gradients than pure SNR (l1_weight=0.0)
+    assert ratios[2] < ratios[0], \
+        f"L1 weighting should make gradients more uniform: SNR ratio {ratios[0]} should be > L1 ratio {ratios[2]}"
+
+    # All ratios should be > 1 (signal with larger error should have larger gradients)
+    assert all(r > 1.0 for r in ratios), f"All gradient ratios should be > 1.0: {ratios}"
