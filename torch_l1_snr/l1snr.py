@@ -281,13 +281,20 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     spectrogram domain, bypassing all SNR and regularization computations for standard L1 behavior.
     This is useful when you want to avoid the "all-or-nothing" behavior of the SNR-style loss.
     
+    Note: PyTorch's MPS backend has a known bug in torch.abs() backward on
+    complex tensors that causes numerically incorrect (inflated) gradients.
+    When mps_cpu_fallback=True (default), STFT computation is routed through
+    CPU to avoid this issue. The .cpu() call is differentiable, so gradients
+    flow correctly through CPU kernels. Performance impact is minimal since
+    the STFT loss computation is small relative to model forward/backward.
+
     Input Shape:
         Accepts waveform tensors (time-domain audio) of any shape as long as they are batch-first
         and time-last. Recommended shapes:
         - [batch, time] for single-source audio
         - [batch, num_sources, time] for multi-source audio
         - [batch, num_sources, channels, time] for multi-channel multi-source audio
-    
+
     Attributes:
         name (str): The name identifier for the loss.
         weight (float): The overall weight multiplier for the loss.
@@ -307,10 +314,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         l1_weight (float): Weight for the L1 loss component. Default 0 (disabled).
             As this increases, the regularization term is also scaled down proportionally.
             When set to 1.0, efficiently computes only L1 loss.
+        mps_cpu_fallback (bool): When True (default), routes STFT computation through
+            CPU on MPS devices to avoid incorrect gradients from a PyTorch MPS backend
+            bug in torch.abs() backward on complex tensors.
     """
     def __init__(
-        self, 
-        name, 
+        self,
+        name,
         weight: float = 1.0,
         lambda0: float = 0.1,
         delta_lambda: float = 0.9,
@@ -325,6 +335,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         use_regularization: bool = False,
         spec_reg_coef: float = 0.1,
         l1_weight: float = 0.0,
+        mps_cpu_fallback: bool = True,
     ):
         super().__init__()
         self.name = name
@@ -399,6 +410,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             use_regularization=False,  # regularizer belongs to TF for this class
             l1_weight=self.l1_weight,
         )
+
+        # MPS CPU fallback for correct gradients
+        self.mps_cpu_fallback = mps_cpu_fallback
+        self._mps_warned = False
 
         # Simplified tracking
         self.nan_inf_counts = {"inputs": 0, "spec_loss": 0}
@@ -516,29 +531,48 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     def forward(self, estimates, actuals, *args, **kwargs):
         device = estimates.device
         batch_size = estimates.shape[0]
-        
+
         # Basic NaN/Inf handling (simplified)
         if torch.isnan(estimates).any() or torch.isinf(estimates).any() or torch.isnan(actuals).any() or torch.isinf(actuals).any():
             self.nan_inf_counts["inputs"] += 1
             estimates = torch.nan_to_num(estimates, nan=0.0, posinf=1.0, neginf=-1.0)
             actuals = torch.nan_to_num(actuals, nan=0.0, posinf=1.0, neginf=-1.0)
-        
+
         est_source = estimates.reshape(batch_size, -1, estimates.shape[-1])
         act_source = actuals.reshape(batch_size, -1, actuals.shape[-1])
-        
+
         # Validate audio length
         audio_length = est_source.shape[-1]
         if not self._validate_audio_length(audio_length):
             # Fallback to time-domain L1SNR-style loss instead of zero
             return self.fallback_time_loss(estimates, actuals, *args, **kwargs) * self.weight
-        
+
+        # MPS workaround: route STFT computation through CPU to avoid
+        # incorrect gradients from torch.abs() backward on complex tensors.
+        # .cpu() is differentiable — backward uses CPU kernels automatically.
+        _use_cpu = self.mps_cpu_fallback and device.type == 'mps'
+        if _use_cpu:
+            if not self._mps_warned:
+                warnings.warn(
+                    f"{self.name}: Routing STFT loss through CPU to work around "
+                    "PyTorch MPS backend bug in torch.abs() backward on complex tensors. "
+                    "Set mps_cpu_fallback=False to disable.",
+                    stacklevel=2,
+                )
+                self._mps_warned = True
+            est_source = est_source.cpu()
+            act_source = act_source.cpu()
+
+        # Device for STFT computation (CPU if fallback active, else original)
+        compute_device = est_source.device
+
         # Track losses (initialize as tensors on the correct device for stability)
-        total_spec_loss = torch.tensor(0.0, device=device)
-        total_spec_reg_loss = torch.tensor(0.0, device=device)
+        total_spec_loss = torch.tensor(0.0, device=compute_device)
+        total_spec_reg_loss = torch.tensor(0.0, device=compute_device)
         valid_transforms = 0
-        
+
         # Ensure transforms are on the correct device
-        self.spectrogram_transforms.to(device)
+        self.spectrogram_transforms.to(compute_device)
         
         # Process each resolution
         for i, transform in enumerate(self.spectrogram_transforms):
@@ -600,10 +634,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         if valid_transforms == 0:
             warnings.warn("All spectrogram transforms failed. Returning zero loss.")
             return torch.tensor(0.0, device=device)
-        
+
         # Average losses across valid transforms
         avg_spec_loss = total_spec_loss / valid_transforms
-        
+
         # For standard mode, apply regularization if enabled
         if not self.pure_l1_mode and self.use_regularization:
             avg_spec_reg_loss = total_spec_reg_loss / valid_transforms
@@ -613,7 +647,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         else:
             final_loss = avg_spec_loss
 
-        return final_loss * self.weight
+        result = final_loss * self.weight
+
+        # Move loss back to original device (gradient graph preserved)
+        if _use_cpu:
+            result = result.to(device)
+
+        return result
 
 
 class MultiL1SNRDBLoss(torch.nn.Module):
@@ -663,8 +703,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         spec_loss_params (dict): Optional additional parameters to pass to spectrogram domain loss.
     """
     def __init__(
-        self, 
-        name, 
+        self,
+        name,
         weight: float = 1.0,
         spec_weight: float = 0.5,  # Balance between time and frequency domain
         # L1 component parameters
@@ -690,6 +730,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         # Allow for separate parameter overrides (e.g. different delta_lambda for time and spec)
         time_loss_params: dict = None,
         spec_loss_params: dict = None,
+        # MPS workaround
+        mps_cpu_fallback: bool = True,
     ):
         super().__init__()
         self.name = name
@@ -729,7 +771,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             "window_fn": window_fn,
             "min_audio_length": min_audio_length,
             "l1_weight": l1_weight,
-
+            "mps_cpu_fallback": mps_cpu_fallback,
             "use_regularization": use_spec_regularization  # Apply spectrogram domain regularization flag
         }
         

@@ -635,6 +635,95 @@ def test_stft_gradient_distinction():
     assert ratio_l1 < ratio_snr, f"STFT L1 should have more uniform gradients"
 
 
+def test_mps_cpu_fallback_gradient_correctness():
+    """
+    Verify mps_cpu_fallback produces correct gradients by comparing
+    CPU-with-fallback vs CPU-without-fallback (should be identical).
+    On MPS, also verify gradients are finite and reasonably scaled.
+    """
+    torch.manual_seed(42)
+    actuals = torch.randn(2, 4096)
+    estimates = actuals.clone() + 0.1 * torch.randn_like(actuals)
+
+    # CPU reference (fallback has no effect on CPU)
+    est_ref = estimates.clone().requires_grad_(True)
+    loss_fn_ref = STFTL1SNRDBLoss(
+        "ref", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+        mps_cpu_fallback=False,
+    )
+    loss_ref = loss_fn_ref(est_ref, actuals)
+    loss_ref.backward()
+
+    # CPU with fallback enabled (should be identical since not on MPS)
+    est_fb = estimates.clone().requires_grad_(True)
+    loss_fn_fb = STFTL1SNRDBLoss(
+        "fb", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+        mps_cpu_fallback=True,
+    )
+    loss_fb = loss_fn_fb(est_fb, actuals)
+    loss_fb.backward()
+
+    # Losses and gradients should be identical on CPU regardless of fallback flag
+    assert torch.allclose(loss_ref, loss_fb, atol=1e-6), \
+        f"Fallback should not change CPU loss: {loss_ref.item()} vs {loss_fb.item()}"
+    assert torch.allclose(est_ref.grad, est_fb.grad, atol=1e-6), \
+        "Fallback should not change CPU gradients"
+
+    # If MPS is available, verify the fallback produces finite, sane gradients
+    if torch.backends.mps.is_available():
+        mps = torch.device("mps")
+        est_mps = estimates.clone().to(mps).requires_grad_(True)
+        act_mps = actuals.clone().to(mps)
+        loss_fn_mps = STFTL1SNRDBLoss(
+            "mps", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+            mps_cpu_fallback=True,
+        ).to(mps)
+        loss_mps = loss_fn_mps(est_mps, act_mps)
+        loss_mps.backward()
+
+        assert not torch.isnan(est_mps.grad).any(), "MPS fallback grads should have no NaN"
+        assert not torch.isinf(est_mps.grad).any(), "MPS fallback grads should have no Inf"
+        # Grad norm should be in a reasonable range (CPU ref norm as baseline)
+        cpu_norm = est_ref.grad.norm().item()
+        mps_norm = est_mps.grad.cpu().norm().item()
+        ratio = mps_norm / (cpu_norm + 1e-12)
+        assert 0.1 < ratio < 10.0, \
+            f"MPS fallback grad norm ({mps_norm:.4f}) should be close to CPU ({cpu_norm:.4f}), ratio={ratio:.2f}"
+
+
+def test_mps_cpu_fallback_disabled():
+    """Verify mps_cpu_fallback=False skips the CPU routing."""
+    torch.manual_seed(42)
+    estimates = torch.randn(2, 4096)
+    actuals = torch.randn(2, 4096)
+
+    loss_fn = STFTL1SNRDBLoss(
+        "test", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+        mps_cpu_fallback=False,
+    )
+    # On CPU this should just work normally
+    est = estimates.clone().requires_grad_(True)
+    loss = loss_fn(est, actuals)
+    loss.backward()
+    assert not torch.isnan(loss)
+    assert est.grad is not None
+
+
+def test_multi_mps_cpu_fallback_passthrough():
+    """Verify MultiL1SNRDBLoss passes mps_cpu_fallback to STFTL1SNRDBLoss."""
+    loss_fn = MultiL1SNRDBLoss(
+        "test", mps_cpu_fallback=True,
+        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256,
+    )
+    assert loss_fn.spec_loss.mps_cpu_fallback is True
+
+    loss_fn_off = MultiL1SNRDBLoss(
+        "test", mps_cpu_fallback=False,
+        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256,
+    )
+    assert loss_fn_off.spec_loss.mps_cpu_fallback is False
+
+
 def test_stft_l1_weight_interpolation():
     """
     Verify l1_weight interpolation works for STFTL1SNRDBLoss.

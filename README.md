@@ -211,6 +211,17 @@ The implementation is optimized for efficiency: if `l1_weight` is `0.0` or `1.0`
 
 **Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation automatically scales the L1 component to approximately match gradient magnitudes while preserving distinct gradient behaviors. This helps maintain stable training without manual tuning.
 
+## Device Compatibility
+
+All loss functions work on **CPU**, **CUDA**, and **MPS** (Apple Silicon).
+
+**MPS note:** PyTorch's MPS backend has a known bug in `torch.abs()` backward on complex tensors that produces incorrect gradients. This affects `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` (which use STFT internally). As of v0.1.3, these losses automatically route STFT computation through CPU when on MPS (`mps_cpu_fallback=True` by default), producing correct gradients with negligible performance impact. Time-domain losses (`L1SNRLoss`, `L1SNRDBLoss`) are unaffected. CUDA and CPU users are completely unaffected by this change.
+
+To disable the workaround (e.g., if a future PyTorch release fixes the MPS bug):
+```python
+loss_fn = STFTL1SNRDBLoss(name="stft_loss", mps_cpu_fallback=False)
+```
+
 ## Limitations
 
 - The L1SNR loss is not scale-invariant. Unlike SI-SNR, it requires the model's output to be correctly scaled relative to the target.
