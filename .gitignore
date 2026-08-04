@@ -67,6 +67,7 @@ venv.bak/
 .cursor/
 .claude/
 CLAUDE.md
+AGENTS.md
 
 # Local config
 local_settings.py
