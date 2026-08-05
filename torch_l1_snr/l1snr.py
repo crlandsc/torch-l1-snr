@@ -299,10 +299,11 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     spectrogram domain, bypassing all SNR and regularization computations for standard L1 behavior.
     This is useful when you want to avoid the "all-or-nothing" behavior of the SNR-style loss.
 
-    Note: PyTorch's MPS backend produces numerically incorrect (inflated) gradients from
-    torch.stft backward on longer inputs. The forward transform is correct; only the backward
-    pass is wrong, and the error is size-dependent, appearing above roughly 65,000 samples and
-    worsening as the input grows. When mps_cpu_fallback=True (default), STFT computation is
+    Note: PyTorch's MPS backend produces numerically incorrect gradients from torch.stft
+    backward above an input length of 65,536 samples (2^16). The forward transform is correct to
+    float32 precision, so the failure is silent. The error is not a simple function of size: a
+    few specific lengths are exact while neighbours are wrong by 30-99%, and any batch size above
+    1 fails even at those lengths. When mps_cpu_fallback=True (default), STFT computation is
     routed through CPU to avoid this issue. The .cpu() call is differentiable, so gradients
     flow correctly through CPU kernels. Performance impact is minimal since the STFT loss
     computation is small relative to model forward/backward. Typical training windows are well

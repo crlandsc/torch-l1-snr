@@ -16,7 +16,7 @@ whose default matches the value already used internally.
   `torch.abs()` backward on complex tensors. That path does not execute in the default configuration: the
   default splits into real and imaginary parts before calling `torch.abs`, so `torch.abs` never receives a
   complex tensor unless `use_regularization=True`. The actual cause is `torch.stft` backward on MPS, which is
-  wrong above roughly 65,000 samples and worsens with input size. The fix was and remains effective; only the
+  wrong above an input length of 65,536 samples (2^16), in a pattern that is not monotone in size. The fix was and remains effective; only the
   explanation was wrong. This matters because the README invites users to disable the workaround once
   upstream is fixed, and they would have been checking the wrong thing.
 - **Corrected the D1 notation.** Docstrings rendered D1 with a summed L1 norm where the code takes a mean.
@@ -68,10 +68,10 @@ whose default matches the value already used internally.
 
 **Fix:** MPS (Apple Silicon) compatibility for STFT-based losses.
 
-PyTorch's MPS backend produces numerically incorrect (inflated) gradients from `torch.stft` backward on
-longer inputs, causing `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` to produce gradient norms far too large on
-MPS and corrupt model weights within a few training steps. The forward transform is correct; only the
-backward pass is affected, above roughly 65,000 samples.
+PyTorch's MPS backend produces numerically incorrect gradients from `torch.stft` backward on longer
+inputs, causing `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` to corrupt model weights within a few training
+steps. The forward transform is correct; only the
+backward pass is affected, above an input length of 65,536 samples (2^16).
 
 **Fix:** Added `mps_cpu_fallback` parameter (default `True`) to `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss`.
 When on MPS, STFT loss computation is automatically routed through CPU via differentiable `.cpu()` calls,
@@ -83,8 +83,10 @@ producing correct gradients. The scalar loss is moved back to MPS for the optimi
 - Set `mps_cpu_fallback=False` to disable the workaround if a future PyTorch release fixes the MPS bug.
 
 > **Note added in 0.1.4:** this entry originally attributed the bug to `torch.abs()` backward on complex
-> tensors. That was incorrect; the cause is `torch.stft` backward above roughly 65,000 samples. See the
-> 0.1.4 entry. The fix itself was effective.
+> tensors. That was incorrect; the cause is `torch.stft` backward above an input length of 65,536 samples.
+> See the 0.1.4 entry. The fix itself was effective. The gradient error direction also differs by PyTorch
+> version: this entry reported inflation, while torch 2.10 shows deflation. The magnitude quoted originally
+> is not reproducible on current versions and has been removed.
 
 ## 0.1.2 (2026-02-04)
 
