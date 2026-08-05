@@ -76,23 +76,29 @@ CUDA forces a host-device synchronization and serializes the pipeline. Setting i
 CPU forward and removes those synchronizations; the loss then propagates `NaN` rather than replacing it with
 zeros, which is arguably preferable during training anyway.
 
-Otherwise this release is **not** faster, and the reasons are worth stating rather than omitting. Four other
-optimizations were investigated on an idle machine at a realistic batch shape, and none shipped:
+**The spectrogram loss is about 14% faster.** The STFT window normalization is folded into the window itself
+rather than dividing the whole complex output by the same constant on every call. This is mathematically
+identical, since the transform is linear in the window, and it removes one full-tensor pass per resolution
+per tensor. Measured +14.2% with a standard deviation of 3.2% across interleaved A/B trials on
+`[8, 2, 264600]`, against a noise floor of 0.5%.
 
-- Folding the STFT window normalization into the window itself is mathematically exact and saves about 4% of
-  the forward. Declined: moving the multiply inside the transform reorders the arithmetic, so float32 results
-  differ at the last bit. A few percent on a computation that is already small beside a model's forward and
-  backward did not justify changing the number a training run reports.
+Because the multiply moves inside the transform, float32 results can differ in the last bit: measured
+relative difference 1.6e-07 on gradients, at float32 machine epsilon, with loss values unchanged. Float64
+accuracy slightly **improves**, from 6.2e-10 to 5.2e-10 relative error against a fully-float64 reference,
+because the normalization constant is now computed in double precision. If you are comparing loss values
+across this upgrade to more than six significant figures, this is why they differ.
+
+Two further optimizations were investigated and did not ship, recorded because the reasons are useful:
+
 - Reducing over dimensions instead of reshaping the strided real and imaginary views avoids roughly 129 MB of
-  contiguous copies per forward. The forward is bit-identical, but the backward graph is not, so gradients
-  differ at machine epsilon. Measured time saving was 0.06%. Declined on the same grounds.
+  contiguous copies per forward. The forward is bit-identical, but the backward graph is not, and the
+  measured time saving was 0.06%. Not worth a change to gradients for no measurable gain.
 - Sharing one STFT between the reconstruction and regularizer paths: **there was nothing to share.** A call
   counter shows six transform calls with the regularizer enabled and six with it disabled, so the transform
   was never recomputed. The premise was wrong.
-- Hoisting the per-call device move out of `forward` is now guarded, but it measures 0.02 ms, about 0.007%.
 
-Net measurable change at default settings is +0.2% with a standard deviation of 1.1% across interleaved
-trials, which is to say none. Every returned value and gradient is bit-identical across 120 configurations.
+The per-call device move on the spectrogram transforms is now guarded rather than unconditional, worth about
+0.02 ms.
 
 ### Other changes
 

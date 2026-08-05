@@ -555,30 +555,45 @@ def test_multi_passes_mps_flag_to_spectrogram_branch():
 
 
 def test_stft_l1_weight_interpolation():
+    """l1_weight must move the spectrogram loss's cross-row gradient profile monotonically toward L1.
+
+    The metric is max/min of the per-row gradient magnitude, which is what "how much L1 behaviour" means:
+    pure D1 weights rows by their own error magnitude (inverse-error), pure L1 weights them equally, so the
+    profile runs from a spread down to 1.0.
+
+    This replaces an earlier version that used a fixed-order ratio grad[0]/grad[1] and asserted every value
+    was > 1.0. That assertion was not a property of the loss. Pure L1 gives uniform gradient magnitudes, so
+    its ratio is ~1.0 rather than above it, and on random signals even the pure-SNR ratio came out below 1.0
+    (measured 0.9669, 0.9599, 0.9943 across three seeds). It held only for the one constant-signal
+    configuration it was written against, and passed by luck rather than by testing anything.
     """
-    Verify l1_weight interpolation works for STFTL1SNRDBLoss.
-    L1 weighting should make gradients more uniform compared to pure SNR.
-    """
-    torch.manual_seed(42)
+    profiles_by_spread = {}
+    for label, quiet_level in (("20 dB", 0.005), ("40 dB", 0.0005)):
+        actuals = torch.stack([
+            torch.randn(4096, generator=torch.Generator().manual_seed(1)) * 0.05,
+            torch.randn(4096, generator=torch.Generator().manual_seed(2)) * quiet_level,
+        ])
+        # a fixed *relative* error on each row, so the rows differ only in level
+        estimates = actuals + 0.1 * actuals.abs().mean(dim=-1, keepdim=True) * torch.randn(
+            actuals.shape, generator=torch.Generator().manual_seed(9))
 
-    actuals = torch.tensor([[1.0] * 4096, [1.0] * 4096])
-    estimates = actuals.clone()
-    estimates[0] += 0.01
-    estimates[1] += 0.5
+        profile = []
+        for w in (0.0, 0.25, 0.5, 0.75, 1.0):
+            est = estimates.clone().requires_grad_(True)
+            loss_fn = STFTL1SNRDBLoss("t", l1_weight=w, n_ffts=[512], hop_lengths=[128],
+                                      win_lengths=[512])
+            loss_fn(est, actuals).backward()
+            per_row = [est.grad[i].abs().mean().item() for i in range(actuals.shape[0])]
+            profile.append(max(per_row) / min(per_row))
 
-    ratios = []
-    for w in [0.0, 0.5, 1.0]:
-        est = estimates.clone().requires_grad_(True)
-        loss_fn = STFTL1SNRDBLoss("test", l1_weight=w, n_ffts=[512], hop_lengths=[128], win_lengths=[512])
-        loss = loss_fn(est, actuals)
-        loss.backward()
-        ratio = (est.grad[0].abs().mean() / est.grad[1].abs().mean()).item()
-        ratios.append(ratio)
+        assert all(profile[i] >= profile[i + 1] - 1e-6 for i in range(len(profile) - 1)), (
+            f"{label}: profile must decrease monotonically as l1_weight rises, got {profile}")
+        assert profile[-1] < 1.05, (
+            f"{label}: pure L1 should give near-uniform gradients, got a profile of {profile[-1]:.4f}")
+        assert profile[0] > profile[-1] + 0.5, (
+            f"{label}: pure SNR should be markedly more level-dependent than pure L1, got {profile}")
+        profiles_by_spread[label] = profile[0]
 
-    # L1 weighting should make gradients more uniform (ratio closer to 1)
-    # Pure L1 (l1_weight=1.0) should have more uniform gradients than pure SNR (l1_weight=0.0)
-    assert ratios[2] < ratios[0], \
-        f"L1 weighting should make gradients more uniform: SNR ratio {ratios[0]} should be > L1 ratio {ratios[2]}"
-
-    # All ratios should be > 1 (signal with larger error should have larger gradients)
-    assert all(r > 1.0 for r in ratios), f"All gradient ratios should be > 1.0: {ratios}"
+    # a wider level spread means a stronger inverse-error weighting under pure SNR
+    assert profiles_by_spread["40 dB"] > profiles_by_spread["20 dB"], (
+        f"a wider level spread should give a larger pure-SNR profile: {profiles_by_spread}")
