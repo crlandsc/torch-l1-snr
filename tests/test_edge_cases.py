@@ -281,7 +281,7 @@ def test_dbrms_floor_is_below_lmin_for_silence():
     silent = torch.zeros(2, 4096)
     level = dbrms(silent)
     assert level.max().item() < -60.0, f"silence reads {level.max().item()} dB, not below lmin=-60"
-    assert abs(level.max().item() - (-79.9991)) < 1e-3
+    assert abs(level.max().item() - (-80.0)) < 1e-5
 
 
 # ---------------------------------------------------------------------------------------------
@@ -689,3 +689,51 @@ def test_partial_resolution_use_matches_a_reference_over_the_same_subset():
                                            win_lengths=(512, 1024))
     assert torch.allclose(got, expected, atol=1e-5), (
         f"library {got.item():.7f} vs reference over the 2 usable resolutions {expected.item():.7f}")
+
+
+# ---------------------------------------------------------------------------------------------
+# C9, C11
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_l1_weight_cannot_be_mutated_after_construction(cls):
+    """Q13: l1_weight was stored in several unsynchronized copies, and mutating the public attribute took
+    effect inconsistently -- the value is baked into child modules and the pure_l1_mode flag at
+    construction. Making the setter work would mean rebuilding children on assignment, which is real
+    complexity for a use case nobody has asked for. Raising is honest and one line.
+    """
+    loss = cls(name="t", l1_weight=0.0)
+    assert loss.l1_weight == 0.0
+    with pytest.raises(AttributeError, match="l1_weight"):
+        loss.l1_weight = 0.5
+
+
+def test_dbrms_outer_epsilon_removal_is_within_the_stated_bound():
+    """Q22/C11: dbrms applied two epsilons of different physical dimension, one inside the sqrt on a power
+    quantity and one outside on an amplitude. The outer one is inert because rms is already at least
+    sqrt(dbrms_eps) = 1e-4, so log10 can never see zero.
+
+    The BREAKING rule has one carve-out, for a change whose numerical effect is measured and stated below a
+    bound. This is that change, and this test is the measurement: it must stay under 0.001 dB.
+    """
+    worst = 0.0
+    for level in [0.0, 1e-6, 1e-4, 1e-3, 0.01, 0.1, 1.0, 10.0]:
+        x = torch.full((1, 4096), level)
+        rms = torch.sqrt((x ** 2).mean() + 1e-8)
+        with_outer = 20.0 * torch.log10(rms + 1e-8)
+        without = 20.0 * torch.log10(rms)
+        worst = max(worst, abs((with_outer - without).item()))
+    assert worst < 1e-3, f"removing the outer epsilon moves dbrms by {worst:.6f} dB, above the stated bound"
+
+
+def test_dbrms_silence_floor_is_exactly_the_power_epsilon():
+    """C11 must not regress the -80 dB floor, which per S10 is better matched to lmin=-60 than the authors'
+    own -30 dB and is the reason a digitally silent target is recognized as silent.
+
+    With the inert outer epsilon gone the floor is exactly 10*log10(eps) = -80.0, rather than the -79.99913
+    the extra term produced. Asserted exactly rather than within a tolerance that the old value also
+    satisfied by 0.0009 dB.
+    """
+    floor = dbrms(torch.zeros(2, 4096)).max().item()
+    assert abs(floor - (-80.0)) < 1e-5, f"silence floor is {floor}, expected exactly -80.0"
+    assert floor < -60.0, "the floor must sit below lmin so silence is recognized as silent"

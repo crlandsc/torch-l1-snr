@@ -73,12 +73,13 @@ def l1snr_blended(est, act, eps=1e-3, l1_weight=0.0, ref_level=None):
 def dbrms(x, eps=1e-8):
     """20*log10(sqrt(mean(x^2) + eps) + eps), one value per batch element.
 
-    Two epsilons of different physical dimension: one inside the sqrt on a power quantity, one outside on an
-    amplitude. Reproduced faithfully because the library's behaviour, not its tidiness, is what is under test.
+    A single epsilon, applied to the mean power inside the sqrt, where it guards log10(0) and sets the
+    silence floor at 10*log10(eps) = -80 dB. An outer epsilon on the amplitude was removed in C11 as a
+    dimensional confusion: rms is already at least sqrt(eps), so it could never prevent a log of zero.
     """
     v = x.reshape(x.shape[0], -1)
     rms = torch.sqrt((v ** 2).mean(dim=-1) + eps)
-    return 20.0 * torch.log10(rms + eps)
+    return 20.0 * torch.log10(rms)
 
 
 def adaptive_lambda(L_pred, L_true, lmin=-60.0, lambda0=0.1, delta_lambda=0.9):
@@ -190,9 +191,9 @@ def multi_res_spec_d1(est, act, n_ffts=(512, 1024, 2048), hop_lengths=(128, 256,
 #   act=[0,0] est=[0,0]  err=0, ref=0  -> 10*log10(0.001/0.001) = 10*log10(1)         = 0.0
 #
 # dbrms, eps = 1e-8:
-#   x=[1,1] -> sqrt(1+1e-8)=1.000000005 -> 20*log10(1.000000015)  = 1.303e-7  (~0 dB)
-#   x=[0,0] -> sqrt(1e-8)=1e-4          -> 20*log10(1.0001e-4)    = -79.9991314
-#   x=[2,2] -> sqrt(4+1e-8)=2.0         -> 20*log10(2.0000000125)  = 6.0205999
+#   x=[1,1] -> sqrt(1+1e-8)=1.000000005 -> 20*log10(1.000000005) = 4.34e-8   (~0 dB)
+#   x=[0,0] -> sqrt(1e-8)=1e-4          -> 20*log10(1e-4)         = -80.0      (exactly)
+#   x=[2,2] -> sqrt(4+1e-8)=2.0         -> 20*log10(2.0)           = 6.0205999
 #
 HAND_CASES_D1 = [
     ([[1.0, 1.0]], [[0.0, 0.0]], 0.0),
@@ -202,7 +203,7 @@ HAND_CASES_D1 = [
 ]
 
 HAND_CASES_DBRMS = [
-    ([[1.0, 1.0]], 1.303e-7),
-    ([[0.0, 0.0]], -79.9991314),
+    ([[1.0, 1.0]], 4.34e-8),
+    ([[0.0, 0.0]], -80.0),
     ([[2.0, 2.0]], 6.0205999),
 ]

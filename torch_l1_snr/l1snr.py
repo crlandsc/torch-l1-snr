@@ -82,15 +82,26 @@ def _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn):
 def dbrms(x, eps=1e-8):
     """
     Compute RMS level in decibels for a batch of signals.
+
+    The epsilon sits inside the sqrt, on the power quantity, where it both guards log10(0) and sets the
+    floor: a digitally silent input reads 20*log10(sqrt(eps)) = -80 dB at the default. That floor is
+    deliberate. It is well below the lmin=-60 threshold the adaptive regularizer uses, so a silent target is
+    correctly recognized as silent, and it improves on the reference implementation's -30 dB.
+
+    A second epsilon was previously also added outside the sqrt, on an amplitude rather than a power
+    quantity. Since rms is already at least sqrt(eps) = 1e-4, log10 could never see zero and the outer term
+    was inert: measured under 0.001 dB across levels from silence to 10.0. Removed as a dimensional
+    confusion rather than a behavioural change; tests hold both the bound and the floor.
+
     Args:
         x: (batch, time) or (batch, ...) tensor
-        eps: stability constant
+        eps: stability constant, applied to the mean power. Also sets the silence floor at 10*log10(eps).
     Returns:
         (batch,) tensor of dB RMS
     """
     x = x.reshape(x.shape[0], -1)
     rms = torch.sqrt(torch.mean(x ** 2, dim=-1) + eps)
-    return 20.0 * torch.log10(rms + eps)
+    return 20.0 * torch.log10(rms)
 
 
 class L1SNRLoss(torch.nn.Module):
@@ -134,7 +145,21 @@ class L1SNRLoss(torch.nn.Module):
         self.name = name
         self.weight = weight
         self.eps = eps
-        self.l1_weight = l1_weight
+        self._l1_weight = l1_weight
+
+    @property
+    def l1_weight(self):
+        """Read-only. The value is baked into child modules and mode flags at construction, so mutating it
+        afterwards took effect inconsistently (Q13). Construct a new loss instead."""
+        return self._l1_weight
+
+    @l1_weight.setter
+    def l1_weight(self, value):
+        raise AttributeError(
+            "l1_weight is read-only: it is baked into child modules and mode flags when the loss is "
+            "constructed, so assigning to it would take effect inconsistently. Construct a new loss with "
+            "the l1_weight you want."
+        )
 
     def forward(self, estimates, actuals, *args, **kwargs):
         _validate_matching_shapes(estimates, actuals)
@@ -249,7 +274,7 @@ class L1SNRDBLoss(torch.nn.Module):
         self.use_regularization = use_regularization
 
         _validate_unit_range("l1_weight", l1_weight)
-        self.l1_weight = l1_weight
+        self._l1_weight = l1_weight
 
         # Initialize component losses based on l1_weight
         if self.l1_weight == 1.0:
@@ -265,6 +290,20 @@ class L1SNRDBLoss(torch.nn.Module):
                 l1_weight=l1_weight,
             )
             self.l1_loss = None
+
+    @property
+    def l1_weight(self):
+        """Read-only. The value is baked into child modules and mode flags at construction, so mutating it
+        afterwards took effect inconsistently (Q13). Construct a new loss instead."""
+        return self._l1_weight
+
+    @l1_weight.setter
+    def l1_weight(self, value):
+        raise AttributeError(
+            "l1_weight is read-only: it is baked into child modules and mode flags when the loss is "
+            "constructed, so assigning to it would take effect inconsistently. Construct a new loss with "
+            "the l1_weight you want."
+        )
 
     @staticmethod
     def compute_adaptive_weight(L_pred, L_true, L_min, lambda0, delta_lambda, R):
@@ -475,7 +514,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self.l1snr_eps = l1snr_eps
 
         _validate_unit_range("l1_weight", l1_weight)
-        self.l1_weight = l1_weight
+        self._l1_weight = l1_weight
 
         # Flag for pure L1 mode
         self.pure_l1_mode = (self.l1_weight == 1.0)
@@ -517,8 +556,20 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self._fallback_warned = False
         self._dropped_warned = False
 
-        # Simplified tracking
-        self.nan_inf_counts = {"inputs": 0, "spec_loss": 0}
+
+    @property
+    def l1_weight(self):
+        """Read-only. The value is baked into child modules and mode flags at construction, so mutating it
+        afterwards took effect inconsistently (Q13). Construct a new loss instead."""
+        return self._l1_weight
+
+    @l1_weight.setter
+    def l1_weight(self, value):
+        raise AttributeError(
+            "l1_weight is read-only: it is baked into child modules and mode flags when the loss is "
+            "constructed, so assigning to it would take effect inconsistently. Construct a new loss with "
+            "the l1_weight you want."
+        )
 
     def _compute_complex_spec_l1snr_loss(self, est_spec, act_spec):
         """
@@ -573,12 +624,9 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
             loss = (1.0 - w) * d1_sum + w * l1_term
             return loss
-        elif w >= 1.0:
-            # Pure L1
-            l1_term = 0.5 * (torch.mean(err_re) + torch.mean(err_im))
-            return l1_term
         else:
-            # Pure SNR (D1)
+            # Pure SNR (D1). There is no w >= 1.0 arm here: pure_l1_mode returns above, so it was
+            # unreachable, which 0% coverage on it confirmed.
             return d1_sum
 
     def _compute_spec_level_matching(self, est_spec, act_spec):
@@ -587,13 +635,9 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         """
         batch_size = est_spec.shape[0]
 
-        # Make sure dimensions match before operations
-        if est_spec.shape != act_spec.shape:
-            # Resize to match the smaller of the two
-            min_freq = min(est_spec.shape[-2], act_spec.shape[-2])
-            min_time = min(est_spec.shape[-1], act_spec.shape[-1])
-            est_spec = est_spec[..., :min_freq, :min_time]
-            act_spec = act_spec[..., :min_freq, :min_time]
+        # No shape reconciliation here. forward now requires estimates and actuals to match, so both
+        # spectrograms are computed from equal-shaped inputs by the same transform and cannot differ. The
+        # crop that used to live here was already dead because the caller had cropped first.
 
         # For level-matching regularization, we use magnitude information
         est_mag = torch.abs(est_spec)
@@ -762,7 +806,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
                 # Check for numerical issues
                 if torch.isnan(spec_loss) or torch.isinf(spec_loss):
-                    self.nan_inf_counts["spec_loss"] += 1
                     continue
 
                 # Only compute regularization if not in pure L1 mode and regularization is enabled
@@ -772,7 +815,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
                         # Check for numerical issues
                         if torch.isnan(spec_reg_loss) or torch.isinf(spec_reg_loss):
-                            self.nan_inf_counts["spec_loss"] += 1
                             spec_reg_loss = 0.0  # Use zero reg_loss if there are issues
 
                         # Accumulate regularization loss
@@ -935,7 +977,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         self.spec_weight = spec_weight
 
         _validate_unit_range("l1_weight", l1_weight)
-        self.l1_weight = l1_weight
+        self._l1_weight = l1_weight
         self.use_time_regularization = use_time_regularization
         self.use_spec_regularization = use_spec_regularization
 
@@ -985,6 +1027,20 @@ class MultiL1SNRDBLoss(torch.nn.Module):
 
         # For reference only, indicate if we're in pure L1 mode
         self.pure_l1_mode = (self.l1_weight == 1.0)
+
+    @property
+    def l1_weight(self):
+        """Read-only. The value is baked into child modules and mode flags at construction, so mutating it
+        afterwards took effect inconsistently (Q13). Construct a new loss instead."""
+        return self._l1_weight
+
+    @l1_weight.setter
+    def l1_weight(self, value):
+        raise AttributeError(
+            "l1_weight is read-only: it is baked into child modules and mode flags when the loss is "
+            "constructed, so assigning to it would take effect inconsistently. Construct a new loss with "
+            "the l1_weight you want."
+        )
 
     def forward(self, estimates, actuals, *args, **kwargs):
         """
