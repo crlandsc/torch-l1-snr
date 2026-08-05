@@ -53,6 +53,18 @@ whose default matches the value already used internally.
 - **Completed this changelog.** Versions 0.0.1 through 0.0.5 were absent, and 0.1.0 was labelled the initial
   release with the wrong date.
 
+**Test suite rebuilt.** Not shipped in the wheel, so this changes nothing for users, but it is the reason to
+trust the corrections above. 112 of the previous 127 test cases compared a wrapper against the function it
+wraps, which is structurally `f(x) == f(x)` and cannot fail for any implementation. Stubbing all four
+`forward` methods to a constant left 122 of 127 passing, and a byte-exact revert of the v0.1.2 bugfix left
+all 127 green.
+
+Tests now compare against an independent reference derived from the published definitions and validated
+against hand-computed values. 259 tests, coverage 79% to 90%, and CI enforces both a mutation gate (every
+test that exercises a `forward` must fail when it returns a constant) and a coverage floor. Reverting the
+v0.1.2 fix now breaks 50 tests. The MPS tests were rewritten to use an input size where the underlying
+PyTorch bug actually manifests; the previous ones compared CPU against CPU and would have passed regardless.
+
 **Packaging.**
 
 - Removed `numpy` from the dependencies. It was declared and documented but never imported.
