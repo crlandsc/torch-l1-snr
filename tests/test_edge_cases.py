@@ -127,23 +127,43 @@ def test_valid_window_names_all_construct(cls):
 # T1-5 -- warning paths
 # ---------------------------------------------------------------------------------------------
 
-def test_spectrogram_failure_warns_and_names_the_resolution():
-    """A resolution whose reflect-pad cannot be satisfied warns rather than failing silently."""
-    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[512, 8192], hop_lengths=[128, 8],
-                              win_lengths=[512, 8192], min_audio_length=16)
-    est, act = audio(2, 600), audio(2, 600, seed=1)
-    with pytest.warns(UserWarning, match="resolution"):
+class _Exploding(torch.nn.Module):
+    """A transform that always raises, to reach the in-loop backstop.
+
+    After A5 filters unusable resolutions up front, a transform that passed the length and frame-count
+    checks should not fail, so the try/except handlers are no longer reachable through the public API. They
+    are kept as defence in depth and tested by forcing the failure, rather than deleted untested or left
+    uncovered.
+    """
+
+    def forward(self, x):
+        raise RuntimeError("synthetic transform failure")
+
+
+def test_a_failing_transform_warns_and_is_skipped():
+    """The in-loop RuntimeError backstop: one resolution fails, the others still contribute."""
+    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[512, 1024], hop_lengths=[128, 256],
+                              win_lengths=[512, 1024], min_audio_length=1)
+    loss_fn.spectrogram_transforms[1] = _Exploding()
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    with pytest.warns(UserWarning, match="resolution 1"):
         loss = loss_fn(est, act)
-    assert loss.ndim == 0
+    expected = reference.spec_blended(est, act, 512, 128, 512)
+    assert torch.allclose(loss, expected, atol=1e-5)
+
+
+def _all_failing_loss():
+    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+                              min_audio_length=1)
+    loss_fn.spectrogram_transforms[0] = _Exploding()
+    return loss_fn
 
 
 def test_all_resolutions_failing_warns():
-    """M6: currently returns a graph-detached zero. A6 makes it graph-connected; the warning stays."""
-    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
-                              min_audio_length=16)
-    est, act = audio(2, 600), audio(2, 600, seed=1)
+    """M6: the warning must fire when nothing contributed."""
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
     with pytest.warns(RuntimeWarning, match="every spectrogram resolution failed"):
-        loss = loss_fn(est, act)
+        loss = _all_failing_loss()(est, act)
     assert loss.item() == 0.0
 
 
@@ -153,12 +173,10 @@ def test_all_resolutions_failing_returns_a_graph_connected_zero():
     Worse than the crash was the silent case: inside MultiL1SNRDBLoss the detached zero made the spectral
     term contribute nothing with no error, so only the time term trained.
     """
-    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
-                              min_audio_length=16)
-    est = audio(2, 600).requires_grad_(True)
+    est = audio(2, 8192).requires_grad_(True)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        loss = loss_fn(est, audio(2, 600, seed=1))
+        loss = _all_failing_loss()(est, audio(2, 8192, seed=1))
     assert loss.grad_fn is not None, "the zero is detached from the graph"
     loss.backward()                                    # must not raise
     assert est.grad is not None
@@ -167,12 +185,13 @@ def test_all_resolutions_failing_returns_a_graph_connected_zero():
 
 def test_multi_keeps_a_spectral_gradient_when_all_resolutions_fail():
     """M6's silent case: inside Multi the detached zero meant only the time term trained, with no signal."""
-    loss_fn = MultiL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
-                               min_audio_length=16, spec_weight=0.5)
-    est = audio(2, 600).requires_grad_(True)
+    loss_fn = MultiL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+                               min_audio_length=1, spec_weight=0.5)
+    loss_fn.spec_loss.spectrogram_transforms[0] = _Exploding()
+    est = audio(2, 8192).requires_grad_(True)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        loss = loss_fn(est, audio(2, 600, seed=1))
+        loss = loss_fn(est, audio(2, 8192, seed=1))
     assert loss.requires_grad
     loss.backward()
     assert est.grad is not None
@@ -609,3 +628,64 @@ def test_l1snrdb_reg_coef_default_preserves_behaviour():
     explicit = L1SNRDBLoss(name="t", use_regularization=True, reg_coef=1.0)(est, act)
     expected = reference.l1snr_db(est, act, use_regularization=True)
     assert torch.allclose(explicit, expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------------------------
+# A5 -- per-resolution length validation
+# ---------------------------------------------------------------------------------------------
+
+# For center=True with pad_mode="reflect" the binding constraint is length > n_fft // 2, which
+# _validate_audio_length never checked. So at 512 samples only 1 of the 3 default resolutions ran, and at
+# 513-1024 only 2 of 3, silently changing the arity of the multi-resolution average.
+@pytest.mark.parametrize("length,expected_used", [
+    (256, 0),       # below every requirement -> time-domain fallback
+    (257, 1),       # n_fft=512 needs 257
+    (512, 1),
+    (513, 2),       # n_fft=1024 needs 513
+    (1024, 2),
+    (1025, 3),      # n_fft=2048 needs 1025
+    (8192, 3),
+])
+def test_only_usable_resolutions_are_used(length, expected_used):
+    """Keep whichever resolutions are valid rather than discarding all of them.
+
+    Falling back wholesale at 512-1024 samples would throw away two working resolutions for none, which is
+    why the plan's original "derive min_audio_length" spec was corrected.
+    """
+    loss_fn = STFTL1SNRDBLoss(name="t", min_audio_length=1)
+    assert loss_fn._usable_resolutions(length) == list(range(expected_used)), (
+        f"at {length} samples, expected {expected_used} usable resolution(s)")
+
+
+def test_dropping_a_resolution_always_warns():
+    """The arity of the average must never change silently."""
+    est, act = audio(2, 600), audio(2, 600, seed=1)
+    with pytest.warns(RuntimeWarning, match="resolution"):
+        STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+
+
+def test_no_warning_when_every_resolution_is_usable():
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+
+
+def test_dropped_resolution_warning_names_which_ones():
+    est, act = audio(2, 600), audio(2, 600, seed=1)
+    with pytest.warns(RuntimeWarning) as rec:
+        STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+    message = " ".join(str(w.message) for w in rec)
+    assert "2048" in message, f"the warning does not name the dropped n_fft: {message}"
+
+
+def test_partial_resolution_use_matches_a_reference_over_the_same_subset():
+    """The value must be the average over the resolutions actually used, not over all three."""
+    est, act = audio(2, 600), audio(2, 600, seed=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+    expected = reference.multi_res_spec_d1(est, act, n_ffts=(512, 1024), hop_lengths=(128, 256),
+                                           win_lengths=(512, 1024))
+    assert torch.allclose(got, expected, atol=1e-5), (
+        f"library {got.item():.7f} vs reference over the 2 usable resolutions {expected.item():.7f}")

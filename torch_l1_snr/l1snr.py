@@ -434,6 +434,12 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self.n_ffts = list(n_ffts)
         self.hop_lengths = list(hop_lengths)
         self.win_lengths = list(win_lengths)
+
+        # Minimum input length each resolution needs. For center=True with pad_mode="reflect" the binding
+        # constraint is length > n_fft // 2, which min_audio_length alone never expressed: at 512 samples
+        # only 1 of the 3 default resolutions could run and at 513-1024 only 2, silently changing the arity
+        # of the multi-resolution average.
+        self._min_lengths = [n_fft // 2 + 1 for n_fft in self.n_ffts]
         self.window_fn_name = window_fn
 
         # Pre-initialize Spectrogram transforms for maximum efficiency
@@ -509,6 +515,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self._mps_warned = False
         self._nan_warned = False
         self._fallback_warned = False
+        self._dropped_warned = False
 
         # Simplified tracking
         self.nan_inf_counts = {"inputs": 0, "spec_loss": 0}
@@ -609,6 +616,18 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         return torch.mean(lambda_weight * R)
 
+    def _usable_resolutions(self, audio_length):
+        """Indices of the resolutions this input length can actually support.
+
+        Returns them rather than a single yes/no so a short input keeps whichever resolutions work instead
+        of discarding all of them: at 600 samples, two of the three defaults are perfectly usable and
+        falling back wholesale would trade two working resolutions for none.
+        """
+        return [
+            i for i, (min_len, hop) in enumerate(zip(self._min_lengths, self.hop_lengths))
+            if audio_length >= min_len and (audio_length // hop) + 1 >= 2
+        ]
+
     def _validate_audio_length(self, audio_length):
         """
         Validates that the audio is long enough for the STFT parameters.
@@ -649,7 +668,21 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         # Validate audio length
         audio_length = est_source.shape[-1]
-        if not self._validate_audio_length(audio_length):
+        usable = self._usable_resolutions(audio_length) if audio_length >= self.min_audio_length else []
+        if usable and len(usable) < len(self.n_ffts):
+            if not self._dropped_warned:
+                dropped = [self.n_ffts[i] for i in range(len(self.n_ffts)) if i not in usable]
+                warnings.warn(
+                    f"{self.name}: input length {audio_length} is too short for resolution(s) with "
+                    f"n_fft={dropped} (each needs at least n_fft//2 + 1 samples). The loss is the average "
+                    f"over the {len(usable)} usable resolution(s) with "
+                    f"n_fft={[self.n_ffts[i] for i in usable]}, so it is not comparable with a run where "
+                    "all resolutions apply. Warned once per loss instance.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._dropped_warned = True
+        if not usable:
             # Fallback to a time-domain loss. This is a *different objective*, not a degraded version of the
             # same one: it returns a single time-domain D1 where the STFT path sums a real and an imaginary
             # term. Inside MultiL1SNRDBLoss it also makes both branches the same quantity, so the user is
@@ -697,8 +730,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Ensure transforms are on the correct device
         self.spectrogram_transforms.to(compute_device)
 
-        # Process each resolution
-        for i, transform in enumerate(self.spectrogram_transforms):
+        # Process each usable resolution. The try/except blocks below remain as a backstop, but with the
+        # requirement checked up front they should no longer be the mechanism that decides the arity.
+        for i in usable:
+            transform = self.spectrogram_transforms[i]
             try:
                 # Compute spectrograms using pre-initialized transforms
                 try:
