@@ -3,3 +3,4 @@ torchaudio
 
 # For development and testing
 pytest
+coverage

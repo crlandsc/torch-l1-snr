@@ -39,7 +39,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest
+          pip install pytest coverage
 
       - name: Run tests
         run: pytest tests/
@@ -48,6 +48,19 @@ jobs:
       # regression here is legible rather than hidden inside the main run.
       - name: Run tests with assertions disabled
         run: python -O -m pytest tests/
+
+      # Audit finding M2: before the rebuild, 122 of 127 tests passed against a library whose four forward()
+      # methods returned a constant. This step stubs them and requires every test that exercises a forward()
+      # to notice. Tests that legitimately do not carry the no_forward marker.
+      - name: Mutation gate (suite must be able to detect a constant loss)
+        run: python tests/mutation_gate.py
+
+      - name: Coverage gate
+        env:
+          PYTHONPATH: tests
+        run: |
+          coverage run --source=torch_l1_snr -m pytest tests/ -q
+          coverage report -m --fail-under=90
 
   version-check:
     name: Tag matches __version__ 🏷️
