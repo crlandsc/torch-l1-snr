@@ -12,6 +12,6 @@ __all__ = [
     "L1SNRDBLoss",
     "STFTL1SNRDBLoss",
     "MultiL1SNRDBLoss",
-] 
+]
 
-__version__ = "0.1.4"
+__version__ = "0.2.0"

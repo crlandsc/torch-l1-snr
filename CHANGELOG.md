@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.2.0 (unreleased)
+
+### BREAKING CHANGES
+
+Read this section before upgrading. **Users at the default `l1_weight=0.0` are unaffected numerically**: all
+four losses return bit-identical values and gradients to 0.1.x on that path. The changes below affect the
+blended path, previously-accepted invalid input, and checkpoint keys.
+
+**1. `l1_weight > 0` now scales the L1 term by a fixed reference level.**
+
+The scale was `c * mean_b(1 / (mean|y|_b + eps))`, a mean of reciprocals computed over the batch. That had two
+measurable problems. One quiet target inflated the scale for the whole batch, so samples at identical relative
+error saw their gradients change because a *different* sample went quiet: up to 4.8x on rows held otherwise
+constant. And the knob's meaning drifted with batch content, with the batch-to-batch spread in how far
+`l1_weight` moves the loss toward L1 reaching 75 percentage points at `l1_weight=0.5`.
+
+Two new parameters replace it. `ref_level` (default `0.05`) is the typical mean-absolute amplitude of your
+targets; `spec_ref_level` defaults to `0.19 * ref_level`, the measured ratio between the normalized-STFT and
+time-domain reference magnitudes. Cross-sample contamination is now exactly zero and the spread falls to 4.7
+points at `l1_weight=0.1` and 19.7 at `0.5`.
+
+*To migrate:* if you train with `l1_weight > 0`, measure the mean absolute value of your targets over a few
+batches and pass it as `ref_level`. The default suits MUSDB-style stems. Being off by 2x shifts the knob about
+5 points; being off by 10x matters. Loss values on the blended path will differ from 0.1.x.
+
+**2. Loss buffers no longer appear in `state_dict`.**
+
+`STFTL1SNRDBLoss` held its STFT windows as persistent buffers, so holding the loss as a model submodule added
+3 keys and 3584 floats to every checkpoint, and changing `n_ffts` made earlier checkpoints fail to load.
+
+*To migrate:* a checkpoint written by 0.1.x contains `...spectrogram_transforms.N.window` keys that 0.2.0 does
+not expect. Load with `strict=False`, or filter those keys out first.
+
+**3. Previously-accepted invalid input now raises `ValueError`.**
+
+- `spec_weight` outside `[0, 1]`. Above 1 the time-domain coefficient `(1 - spec_weight)` went negative, which
+  instructed the optimizer to *maximize* waveform error. This was accepted silently and the docstring invited
+  it by saying "set higher to emphasize spectral accuracy" with no stated bound.
+- `l1_weight` outside `[0, 1]` on `L1SNRLoss`, the only class that had not validated it. `-0.5` silently took
+  the pure-SNR branch and `2.0` the pure-L1 branch.
+- `estimates` and `actuals` of differing shape. These were previously reconciled by flattening, so
+  `(2, 4, 8000)` against `(2, 2, 16000)` returned a plausible number from a wrong pairing.
+- An unrecognized `window_fn`, which previously surfaced as an `AttributeError` about a mangled attribute name.
+- A non-positive `ref_level`.
+
+Validation now raises `ValueError` rather than using bare `assert`, which `python -O` strips. Under 0.1.x with
+`-O`, out-of-range values produced a silently wrong loss.
+
+**4. `l1_weight` is read-only after construction.**
+
+It is baked into child modules and mode flags when the loss is built, so assigning to it changed the number
+without changing the behaviour it had already determined. Construct a new loss instead.
+
+**5. Short-audio and dtype behaviour changed.**
+
+- `STFTL1SNRDBLoss(use_regularization=True)` below `min_audio_length` previously dropped the regularizer
+  silently. A total collapse then scored exactly `0.000000`, which is the failure the regularizer exists to
+  prevent. It is now applied, at a coefficient matched to `spec_reg_coef` so its weight is continuous across
+  the boundary.
+- Output dtype follows input dtype. `STFTL1SNRDBLoss` previously downcast float64 to float32 while its
+  siblings did not.
+- Inputs of 512-1024 samples now warn about which STFT resolutions were dropped. The resolutions used are
+  unchanged; the arity of the multi-resolution average is simply no longer silent.
+
+**Not breaking, but stated for completeness:** `dbrms` applied a second, dimensionally inconsistent epsilon
+outside the square root. It could never prevent a log of zero and is removed. Measured effect below 0.001 dB
+across levels from silence to 10.0; the -80 dB silence floor is preserved exactly.
+
+### Other changes
+
+- Silent degradations are now audible. One-shot warnings per loss instance when non-finite input is sanitized
+  (a diverged run previously reported a healthy `0.0`), when every STFT resolution fails, and when the
+  spectrogram branch falls back to the time domain inside `MultiL1SNRDBLoss`, which makes both of its branches
+  the same quantity.
+- The all-resolutions-failed path returns a graph-connected zero. Previously `.backward()` raised, and inside
+  `MultiL1SNRDBLoss` the detached zero silently contributed nothing while the time term went on training.
+- `README` documents what `l1_weight` actually delivers, measured, instead of stating it as a proportion.
+- Mutable list defaults (`n_ffts`, `hop_lengths`, `win_lengths`) are copied per instance.
+- Dead code removed: an unreachable pure-L1 branch, a redundant shape reconciliation, and a write-only
+  counter superseded by the warning above.
+
+
 ## 0.1.4 (unreleased)
 
 Documentation accuracy and packaging hygiene. **No behavioral change**: no loss value, gradient, or API
@@ -23,8 +105,11 @@ whose default matches the value already used internally.
   The code is right (it matches the authors' reference implementation); the notation was not. Reading the
   old formula literally would predict values differing by about 1.5 dB.
 - **Scoped the gradient-balancing claim.** The README said the L1 component is scaled to "approximately
-  match gradient magnitudes". That holds near 0 dB SNR only; the ratio is roughly 1:1 at 0 dB, 9:1 at 20 dB
-  and 75:1 at 60 dB. The scaling's real purpose is to keep the two components' gradient profiles distinct.
+  match gradient magnitudes". It is comparable near 0 dB SNR only: the L1 term's gradient is independent of
+  the error while L1SNR's grows as the error shrinks, so the ratio widens as the model improves. The README
+  now states measured figures for a stated configuration rather than as universal constants, since they
+  depend on target level. The scaling's real purpose is to keep the two components' gradient profiles
+  distinct.
 - **Scoped the NaN/Inf robustness claim** to `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss`. The time-domain
   losses do not sanitize non-finite input, and a NaN estimate yields a NaN loss.
 - **Corrected the short-audio docstring**, which claimed zero loss is returned. A time-domain fallback is

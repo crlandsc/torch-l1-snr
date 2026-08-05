@@ -109,11 +109,11 @@ estimates = torch.randn(4, 2, 44100, requires_grad=True)  # Batch of 4, stereo, 
 actuals = torch.randn(4, 2, 44100)
 
 # Initialize the loss function with regularization enabled
-# l1_weight=0.1 blends 90% L1SNR+Regularization with 10% L1 loss
+# l1_weight=0.1 leans heavily toward L1SNR; see the calibration note below
 loss_fn = L1SNRDBLoss(
     name="l1_snr_db_loss",
     use_regularization=True,  # Enable adaptive level-matching regularization
-    l1_weight=0.1             # 10% L1 loss, 90% L1SNR + regularization
+    l1_weight=0.1             # interpolation coefficient, not a behaviour fraction
 )
 
 # Calculate loss
@@ -167,7 +167,7 @@ loss_fn = MultiL1SNRDBLoss(
     weight=1.0,                    # Overall weight for this loss
     spec_weight=0.6,               # coefficients: 0.4 * time_loss + 0.6 * spec_loss
                                    # (see Limitations: 0.5 is the paper-faithful default)
-    l1_weight=0.1,                 # Use 10% L1, 90% L1SNR+Reg in both domains
+    l1_weight=0.1,                 # applies to both domains; see the calibration note
     use_time_regularization=True,  # Enable regularization in time domain
     use_spec_regularization=False  # Disable regularization in spec domain
 )
@@ -227,11 +227,40 @@ So I recommend starting with no standard L1 mixed in (`l1_weight=0.0`), and then
 -   `l1_weight=1.0`: Pure standard L1 loss.
 -   `0.0 < l1_weight < 1.0`: A weighted combination of the two.
 
+#### `l1_weight` is an interpolation coefficient, not a behaviour fraction
+
+`l1_weight=0.1` does **not** mean "10% L1 behaviour". Both terms push the gradient in the same direction, so what the knob actually controls is how strongly each sample's update is scaled by its own error magnitude: L1SNR scales inversely with error, L1 does not. Measuring how far that scaling has moved from pure L1SNR toward pure L1:
+
+| `l1_weight` | 0.1 | 0.3 | 0.5 | 0.7 | 0.9 |
+|---|---|---|---|---|---|
+| toward L1, near-uniform target levels | 3.6% | 12.5% | 25.0% | 43.7% | 75.0% |
+| toward L1, 40-60 dB level spread | 8.2% | 25.6% | 44.5% | 65.2% | 87.8% |
+
+So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch. Earlier versions of this README stated these as flat percentages matching the parameter value, which was wrong in both directions depending on the data.
+
+Two practical consequences. Starting at `l1_weight=0.1` introduces less L1 character than the number suggests, so if the knob seems to do nothing, try larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5`, the time-domain component moves about 25% toward L1 while the spectrogram component moves about 45%, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
+
+#### `ref_level`: what the L1 term is scaled against
+
+When blending, the L1 term is scaled to be comparable with a decibel quantity, using `ref_level` (default `0.05`) as the assumed typical mean-absolute amplitude of your targets. That default is the measured median for MUSDB-style stems.
+
+Before v0.2.0 this scale was computed per batch as a mean of reciprocals, which had two problems: one quiet target inflated the gradient for every other sample in the batch, and the knob's meaning drifted with batch content. Batch-to-batch spread in the figures above was 49.7 points at `l1_weight=0.1` and 75.4 at `0.5`; it is now 4.7 and 19.7.
+
+To set it for your own data, measure the mean absolute value of your targets over a few batches and pass that. Being off by 2x moves the knob roughly 5 points; being off by 10x matters. `ref_level` also works as a deliberate calibration handle, since it shifts the whole curve:
+
+| `ref_level` | 1.0 | 0.2 | **0.05** | 0.0125 | 0.005 |
+|---|---|---|---|---|---|
+| toward L1 at `l1_weight=0.5` | 3.9% | 16.9% | **44.5%** | 75.2% | 87.2% |
+
+The spectrogram domain uses `spec_ref_level`, which defaults to `0.19 * ref_level`. That ratio is measured: across 496 real stem excerpts the normalized-STFT reference magnitude is about 5.6x below the time-domain one. Setting `spec_ref_level` equal to `ref_level` would be roughly 5x too large and cost about 20 points of knob position at `l1_weight=0.5`, so prefer leaving it derived unless you have measured your own.
+
 The implementation is optimized for efficiency: if `l1_weight` is `0.0` or `1.0`, the unused loss component is not computed, saving computational resources.
 
 **Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation scales the L1 component by the reference signal magnitude rather than the error magnitude. The purpose is to keep the two components' gradient *profiles* distinct: L1SNR produces inverse-error-scaled gradients while L1 produces uniform ones, and scaling by the error would collapse the second into the first (this was the v0.1.2 bugfix).
 
-The scaling brings the two components to a comparable magnitude near 0 dB SNR, but it does not equalize them across the range. The auto-scaled L1 gradient norm is constant with respect to SNR while L1SNR's grows as the error shrinks, so their ratio is roughly 1:1 at 0 dB, 9:1 at 20 dB, and 75:1 at 60 dB. Treat `l1_weight` as an interpolation coefficient to tune, not a guaranteed balance.
+The scaling brings the two components to a comparable magnitude near 0 dB SNR, but it does not equalize them across the range, and it is not intended to. The L1 term's gradient magnitude is independent of the error, while L1SNR's grows as the error shrinks, so the ratio between them necessarily widens as the model improves. Measured on a single 8192-sample target at `mean|y| = 0.05` with `ref_level=0.05`, the D1-to-L1 gradient-norm ratio is about 1.2 at 0 dB SNR, 10 at 20 dB, 36 at 40 dB and 49 at 60 dB.
+
+Those particular numbers depend on the target level and on how `ref_level` is set, so treat them as an illustration of the trend rather than constants. The point to take away is that `l1_weight` is an interpolation coefficient to tune, not a guaranteed balance between the two terms.
 
 ## Device Compatibility
 

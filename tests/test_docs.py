@@ -222,6 +222,29 @@ def test_d1_notation_is_mean_not_sum():
 # B10, B12, B14, B16, B17 -- README claims
 # --------------------------------------------------------------------------------------
 
+def test_no_proportional_l1_weight_claims():
+    """M22/B18: the README stated l1_weight as a behaviour fraction ("l1_weight=0.1 blends 90% L1SNR with
+    10% L1"). Measured, 0.1 delivers 3.6%-8.2% depending on the batch's level spread."""
+    for bad in ["10% L1 loss", "90% L1SNR", "blends 90%"]:
+        assert bad not in README, f"README still states l1_weight as a proportion: {bad!r}"
+    assert "interpolation coefficient, not a behaviour fraction" in README, (
+        "README does not state what l1_weight actually is")
+
+
+def test_readme_documents_ref_level_and_its_derivation():
+    """A14 introduced two parameters whose defaults rest on measurements; both must be explained."""
+    assert "ref_level" in README
+    assert "spec_ref_level" in README
+    assert "0.19" in README, "the measured STFT-to-time reference ratio is not stated"
+
+
+def test_readme_states_the_per_domain_difference():
+    """M23: at l1_weight=0.5 the time domain moves ~25% toward L1 and the spectrogram ~45%, so the single
+    knob means different things in the two halves of MultiL1SNRDBLoss."""
+    assert "different things in its two halves" in README or "two halves" in README, (
+        "README does not state that l1_weight's effect differs by domain")
+
+
 def test_no_unscoped_gradient_matching_claim():
     """Q3: holds only near 0 dB SNR. Measured ratio 1.00 at 0 dB, 9.00 at 20 dB, 74.81 at 60 dB."""
     assert "approximately match gradient magnitudes" not in README, (
