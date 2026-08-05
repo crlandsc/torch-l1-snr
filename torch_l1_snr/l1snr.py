@@ -318,8 +318,8 @@ class L1SNRDBLoss(torch.nn.Module):
         # Initialize component losses based on l1_weight
         if self.l1_weight == 1.0:
             # Pure L1 mode - only need L1 loss
-            self.l1snr_loss = None
-            self.l1_loss = torch.nn.L1Loss()
+            self.l1snr_loss: Optional[L1SNRLoss] = None
+            self.l1_loss: Optional[torch.nn.Module] = torch.nn.L1Loss()
         else:
             # Standard mode with L1SNR (and optional weighted L1 if l1_weight > 0)
             self.l1snr_loss = L1SNRLoss(
@@ -606,10 +606,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Flag for pure L1 mode
         self.pure_l1_mode = (self.l1_weight == 1.0)
         # Create L1 loss function for pure L1 mode
-        if self.pure_l1_mode:
-            self.l1_loss = torch.nn.L1Loss()
-        else:
-            self.l1_loss = None
+        self.l1_loss: Optional[torch.nn.Module] = torch.nn.L1Loss() if self.pure_l1_mode else None
 
 
         # Add this parameter to control regularization

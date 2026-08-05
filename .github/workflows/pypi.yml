@@ -55,6 +55,28 @@ jobs:
       - name: Mutation gate (suite must be able to detect a constant loss)
         run: python tests/mutation_gate.py
 
+      # PEP 561: without py.typed, no type hint in this package reaches a downstream checker, and the
+      # marker only matters if it actually ships. Checked by building a wheel and looking inside, rather
+      # than by asserting the file exists in the source tree.
+      #
+      # A fuller check -- installing the wheel somewhere clean and running mypy on a consumer snippet -- was
+      # attempted and abandoned: the test job installs the package editable, and mypy cannot resolve an
+      # editable install from outside the source tree, so the check passed or failed for reasons unrelated
+      # to py.typed. Verifying the wheel contents tests the mechanism without that confound.
+      - name: py.typed ships in the wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir /tmp/whl
+          python - <<'PY'
+          import glob, zipfile, sys
+          names = zipfile.ZipFile(glob.glob("/tmp/whl/*.whl")[0]).namelist()
+          if not any(n.endswith("torch_l1_snr/py.typed") for n in names):
+              sys.exit("py.typed is missing from the built wheel; type hints will not reach consumers")
+          if any(n.startswith("tests") for n in names):
+              sys.exit("the tests package leaked into the wheel")
+          print("wheel contains py.typed and excludes tests")
+          PY
+
       - name: Coverage gate
         env:
           PYTHONPATH: tests
