@@ -295,6 +295,16 @@ def test_logo_carries_no_authoring_identifiers():
         assert leaked not in blob, f"logo.png still carries {leaked!r}"
 
 
+def test_py_typed_is_present_and_packaged():
+    """Q10: without py.typed, PEP 561 says no type hint in this package reaches a downstream checker.
+
+    Presence alone is not enough -- the marker has to be declared as package_data or it is absent from the
+    built wheel, which is where it actually matters.
+    """
+    assert (REPO / "torch_l1_snr" / "py.typed").exists(), "py.typed marker file is missing"
+    assert "py.typed" in SETUP_CFG, "py.typed is not declared as package_data, so it will not ship"
+
+
 def test_copyright_identifier_is_consistent():
     """Q17: LICENSE says 'Christopher Landschoot', the source header says 'crlandsc'."""
     holder = "Christopher Landschoot"
