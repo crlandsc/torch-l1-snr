@@ -218,6 +218,11 @@ class L1SNRDBLoss(torch.nn.Module):
         l1_weight (float): Weight for the L1 loss component. Default 0 (disabled).
             As this increases, the regularization term is also scaled down proportionally.
             When set to 1.0, efficiently computes only L1 loss.
+        reg_coef (float): Coefficient scaling the level-matching regularization, applied on top of
+            (1 - l1_weight). Default 1.0, the historical behaviour. Exists so STFTL1SNRDBLoss can
+            give its short-audio fallback the same regularizer weight as its own spectral path
+            (spec_reg_coef), keeping that weight continuous across the fallback boundary instead of
+            jumping by 10x.
     """
     def __init__(
         self,
@@ -230,10 +235,12 @@ class L1SNRDBLoss(torch.nn.Module):
         lmin: float = -60.0,
         use_regularization: bool = True,
         l1_weight: float = 0.0,
+        reg_coef: float = 1.0,
     ):
         super().__init__()
         self.name = name
         self.weight = weight
+        self.reg_coef = reg_coef
         self.lambda0 = lambda0          # minimum regularization weight
         self.delta_lambda = delta_lambda # range of extra weight
         self.l1snr_eps = l1snr_eps
@@ -315,7 +322,7 @@ class L1SNRDBLoss(torch.nn.Module):
 
             # Scale regularization by the same factor as L1SNR loss
             l1snr_weight = 1.0 - self.l1_weight
-            total_loss = l1snr_loss + (l1snr_weight * torch.mean(reg_loss))
+            total_loss = l1snr_loss + (l1snr_weight * self.reg_coef * torch.mean(reg_loss))
         else:
             # Skip regularization calculation entirely
             total_loss = l1snr_loss
@@ -445,6 +452,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                 normalized=True,
                 power=None,  # This ensures the output is complex
             )
+            # torchaudio registers `window` as a *persistent* buffer, so a ModuleList of Spectrograms
+            # otherwise enters the enclosing model's state_dict. Re-register it non-persistent: the window is
+            # derived deterministically from n_fft, so it is configuration rather than learned state, and
+            # keeping it in checkpoints also breaks loading when n_ffts changes.
+            window = transform.window
+            del transform._buffers["window"]
+            transform.register_buffer("window", window, persistent=False)
             self.spectrogram_transforms.append(transform)
 
         # Parameters for spectrogram domain level-matching
@@ -480,7 +494,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             l1snr_eps=self.l1snr_eps,
             dbrms_eps=self.dbrms_eps,
             lmin=self.lmin,
-            use_regularization=False,  # regularizer belongs to TF for this class
+            # Pass the flag through rather than hardcoding False. Dropping it silently removed the
+            # anti-collapse protection the user explicitly asked for, on exactly the inputs where a silent
+            # estimate scores zero. reg_coef is matched to spec_reg_coef so the regularizer's weight is
+            # continuous across the fallback boundary: the STFT path scales by spec_reg_coef, and
+            # L1SNRDBLoss had no coefficient at all, so a naive pass-through would be 10x stronger.
+            use_regularization=use_regularization,
+            reg_coef=spec_reg_coef,
             l1_weight=self.l1_weight,
         )
 
@@ -666,9 +686,12 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Device for STFT computation (CPU if fallback active, else original)
         compute_device = est_source.device
 
-        # Track losses (initialize as tensors on the correct device for stability)
-        total_spec_loss = torch.tensor(0.0, device=compute_device)
-        total_spec_reg_loss = torch.tensor(0.0, device=compute_device)
+        # Accumulate in the input's own dtype. An untyped torch.tensor(0.0) is float32, which silently
+        # downcast float64 input while the time-domain siblings preserved it. Half precision promotes to
+        # float32 so accumulation does not happen in half.
+        acc_dtype = est_source.dtype if est_source.dtype in (torch.float32, torch.float64) else torch.float32
+        total_spec_loss = torch.zeros((), dtype=acc_dtype, device=compute_device)
+        total_spec_reg_loss = torch.zeros((), dtype=acc_dtype, device=compute_device)
         valid_transforms = 0
 
         # Ensure transforms are on the correct device

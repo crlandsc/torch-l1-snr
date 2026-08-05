@@ -322,14 +322,26 @@ def test_dtype_is_preserved_in_the_time_domain(dtype):
         assert cls(name="t")(est, act).dtype == dtype
 
 
-def test_stft_downcasts_float64_today():
-    """M13: STFTL1SNRDBLoss silently returns float32 from float64 input while its siblings do not.
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_float64_is_not_downcast(cls):
+    """M13/A9: STFTL1SNRDBLoss silently returned float32 from float64 input while its siblings did not.
 
-    Pinned as current behaviour; A9 fixes it and this test inverts.
+    Returning float32 from half precision is defensible under AMP; losing float64 is not, and the
+    disagreement between siblings is a contract defect either way.
     """
     est = audio(2, 4096).double()
     act = audio(2, 4096, seed=1).double()
-    assert STFTL1SNRDBLoss(name="t")(est, act).dtype == torch.float32
+    assert cls(name="t")(est, act).dtype == torch.float64
+
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_half_precision_promotes_to_float32(cls, dtype):
+    """Documented AMP behaviour: half precision promotes rather than accumulating in half."""
+    est = audio(2, 4096).to(dtype)
+    act = audio(2, 4096, seed=1).to(dtype)
+    out = cls(name="t")(est, act)
+    assert out.dtype in (torch.float32, dtype), f"unexpected output dtype {out.dtype}"
 
 
 def test_non_contiguous_input_works():
@@ -525,3 +537,75 @@ def test_multi_does_not_leak_lists_through_its_spectral_branch(attr):
     assert la is not lb
     la.append(99999)
     assert 99999 not in lb
+
+
+# ---------------------------------------------------------------------------------------------
+# A8, A10
+# ---------------------------------------------------------------------------------------------
+
+class _Wrapper(torch.nn.Module):
+    """The standard Lightning pattern: hold the loss as a submodule of the model."""
+
+    def __init__(self, loss):
+        super().__init__()
+        self.net = torch.nn.Linear(4, 4)
+        self.loss = loss
+
+
+@pytest.mark.parametrize("cls", [STFTL1SNRDBLoss, MultiL1SNRDBLoss], ids=lambda c: c.__name__)
+def test_loss_adds_no_keys_to_an_enclosing_state_dict(cls):
+    """M8/A8: torchaudio registers the Spectrogram window as a *persistent* buffer, so a ModuleList of them
+    entered every checkpoint -- 3 keys and 3584 floats for the default resolutions."""
+    plain = set(torch.nn.Module.state_dict(_Wrapper(torch.nn.Identity())).keys())
+    with_loss = set(_Wrapper(cls(name="t")).state_dict().keys())
+    added = {k for k in with_loss if "window" in k}
+    assert not added, f"the loss added {len(added)} window buffer(s) to the checkpoint: {sorted(added)}"
+
+
+def test_checkpoint_survives_a_change_of_resolutions():
+    """M8's concrete symptom: retuning n_ffts made an earlier checkpoint fail to load."""
+    model_a = _Wrapper(STFTL1SNRDBLoss(name="t", n_ffts=[512, 1024, 2048],
+                                       hop_lengths=[128, 256, 512], win_lengths=[512, 1024, 2048]))
+    state = model_a.state_dict()
+    model_b = _Wrapper(STFTL1SNRDBLoss(name="t", n_ffts=[256, 512], hop_lengths=[64, 128],
+                                       win_lengths=[256, 512]))
+    model_b.load_state_dict(state)          # strict=True; must not raise
+
+
+def test_short_audio_keeps_the_regularizer_when_it_was_requested():
+    """M20/A10: the fallback was built with a hardcoded use_regularization=False, so
+    STFTL1SNRDBLoss(use_regularization=True) below min_audio_length silently lost the anti-collapse
+    protection the user explicitly asked for. Measured: a silent estimate against a non-silent target gave
+    loss exactly 0.000000, which is the collapse the regularizer exists to prevent."""
+    act = audio(2, 400, level=0.1)
+    est = torch.zeros_like(act)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss = STFTL1SNRDBLoss(name="t", use_regularization=True, min_audio_length=512)(est, act)
+    assert loss.item() != 0.0, "a total collapse on short audio still scores zero"
+    assert loss.item() > 0.0, "the regularizer should penalize the collapse"
+
+
+def test_short_audio_regularizer_coefficient_matches_the_stft_path():
+    """A10's design point: naive pass-through would give the fallback a 10x stronger regularizer, because
+    the STFT path scales by spec_reg_coef=0.1 while L1SNRDBLoss had no coefficient at all."""
+    act = audio(2, 400, level=0.1)
+    est = torch.zeros_like(act)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        a = STFTL1SNRDBLoss(name="t", use_regularization=True, spec_reg_coef=0.1,
+                            min_audio_length=512)(est, act).item()
+        b = STFTL1SNRDBLoss(name="t", use_regularization=True, spec_reg_coef=1.0,
+                            min_audio_length=512)(est, act).item()
+        base = STFTL1SNRDBLoss(name="t", use_regularization=False, min_audio_length=512)(est, act).item()
+    assert abs((b - base) / (a - base) - 10.0) < 0.1, (
+        "the fallback regularizer does not track spec_reg_coef, so its weight jumps across the boundary")
+
+
+def test_l1snrdb_reg_coef_default_preserves_behaviour():
+    """A10 adds reg_coef to L1SNRDBLoss. Its default must reproduce the previous computation exactly."""
+    act = audio(2, 4096, level=0.1)
+    est = act + audio(2, 4096, level=0.01, seed=3)
+    explicit = L1SNRDBLoss(name="t", use_regularization=True, reg_coef=1.0)(est, act)
+    expected = reference.l1snr_db(est, act, use_regularization=True)
+    assert torch.allclose(explicit, expected, atol=1e-6)
