@@ -4,10 +4,17 @@ on:
   push:
     branches:
       - main
+      - "release/**"
     tags:
       - "v*"
   pull_request:
   workflow_dispatch:
+
+# Avoid duplicate runs when a release/** branch also has an open PR. Never cancel a tag run: that is the
+# only ref that can publish, and interrupting it mid-flight is not something to risk for saved CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
