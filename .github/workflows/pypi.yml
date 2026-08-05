@@ -2,14 +2,21 @@ name: Publish Python 🐍 distribution 📦 to PyPI
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
 
 jobs:
   test:
-    name: Run tests 🧪
+    name: Run tests 🧪 (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
 
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +26,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: |
@@ -30,9 +37,35 @@ jobs:
       - name: Run tests
         run: pytest tests/
 
+      # Validation must survive python -O, which strips bare `assert`. Kept as its own step so a
+      # regression here is legible rather than hidden inside the main run.
+      - name: Run tests with assertions disabled
+        run: python -O -m pytest tests/
+
+  version-check:
+    name: Tag matches __version__ 🏷️
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compare tag against __version__
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('torch_l1_snr/__init__.py').read()).group(1))")
+          echo "tag=$TAG  __version__=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG does not match __version__ $PKG"
+            exit 1
+          fi
+
   build:
     name: Build distribution 📦
-    needs: test
+    needs: [test, version-check]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     steps:
@@ -62,6 +95,7 @@ jobs:
   publish-to-pypi:
     name: Publish Python 🐍 distribution 📦 to PyPI
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     environment:
