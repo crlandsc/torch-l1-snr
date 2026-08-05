@@ -59,10 +59,17 @@ def test_readme_example_runs(idx):
     exec(compile(block, f"<README block {idx}>", "exec"), {"__name__": "__readme__"})
 
 
-def test_every_readme_example_calls_backward():
-    """M1: one example survived only because it omitted .backward(). Coverage must be uniform."""
-    missing = [i for i, b in enumerate(readme_python_blocks()) if ".backward()" not in b]
-    assert not missing, f"README example(s) {missing} never exercise the backward pass"
+def test_every_loss_example_calls_backward():
+    """M1: one example survived only because it omitted .backward(). Coverage must be uniform.
+
+    Scoped to blocks that construct a loss. A utility example (dbrms returns a level, not an objective) has
+    no backward pass to exercise, and demanding one would be nonsense rather than rigour.
+    """
+    missing = [
+        i for i, b in enumerate(readme_python_blocks())
+        if re.search(r"\w*Loss\(", b) and ".backward()" not in b
+    ]
+    assert not missing, f"README loss example(s) {missing} never exercise the backward pass"
 
 
 # --------------------------------------------------------------------------------------
@@ -72,8 +79,13 @@ def test_every_readme_example_calls_backward():
 def _mps_passages():
     changelog_013 = CHANGELOG.split("## 0.1.3")[1].split("## ")[0]
     readme_mps = README.split("**MPS note:**")[1].split("##")[0]
-    source_mps = SOURCE.split("Note: PyTorch's MPS backend")[1][:600]
-    return {"CHANGELOG 0.1.3": changelog_013, "README": readme_mps, "l1snr.py": source_mps}
+    source_mps = SOURCE.split("Note: PyTorch's MPS backend")[1][:900]
+    passages = {"CHANGELOG 0.1.3": changelog_013, "README": readme_mps, "l1snr.py": source_mps}
+    # Drop blockquoted editorial notes. A retraction has to name the wrong cause to be intelligible to
+    # someone who read the original, so quoting "torch.abs" inside one is correct rather than a relapse.
+    # What must not survive anywhere is the *claim* that torch.abs is the cause.
+    return {k: "\n".join(l for l in v.splitlines() if not l.lstrip().startswith(">"))
+            for k, v in passages.items()}
 
 
 @pytest.mark.parametrize("where", ["CHANGELOG 0.1.3", "README", "l1snr.py"])
