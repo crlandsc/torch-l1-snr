@@ -5,12 +5,12 @@ validations and all six warning paths were unasserted, and silence -- the domina
 losses -- had no test at all. Coverage was 79%, and the uncovered set was almost exactly the defensive code
 plus the novel spectrogram regularizer.
 
-A note on the validation tests. The library currently validates with bare `assert`, so these expect
-`AssertionError` and are skipped under `python -O`, where the checks vanish entirely. **That skip is the
-defect, not a workaround**: it marks exactly what audit finding M15 describes. Task A3 converts these to
-`ValueError`, at which point the skipif comes off and the suite's `python -O` run covers them for real. Until
-then the skip keeps the marker honest rather than pretending the checks survive optimization.
+Validation raises `ValueError`, not `AssertionError`, so these tests run under `python -O` too. That is
+finding M15: bare `assert` is removed by the optimizer, and out-of-range values then produce a silently wrong
+loss instead of an error. The suite's `python -O` job is what holds this.
 """
+import ast
+import pathlib
 import warnings
 
 import pytest
@@ -25,12 +25,6 @@ from torch_l1_snr import (
     MultiL1SNRDBLoss,
 )
 
-# Validation is stripped by python -O today (M15). A3 fixes that; see the module docstring.
-needs_assertions = pytest.mark.skipif(
-    not __debug__,
-    reason="validation uses bare assert, which python -O removes (M15). A3 converts it to ValueError.",
-)
-
 ALL_CLASSES = [L1SNRLoss, L1SNRDBLoss, STFTL1SNRDBLoss, MultiL1SNRDBLoss]
 
 
@@ -43,43 +37,82 @@ def audio(*shape, level=0.05, seed=0):
 # T1-5 -- validation paths
 # ---------------------------------------------------------------------------------------------
 
-@needs_assertions
-@pytest.mark.parametrize("cls", [L1SNRDBLoss, STFTL1SNRDBLoss, MultiL1SNRDBLoss],
-                         ids=lambda c: c.__name__)
-@pytest.mark.parametrize("bad", [-0.5, 1.5, 2.0])
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("bad", [-0.5, -1e-9, 1.5, 2.0])
 def test_l1_weight_out_of_range_is_rejected(cls, bad):
-    with pytest.raises(AssertionError, match="l1_weight"):
+    """M14/A2: all four classes now validate. L1SNRLoss was the only one that did not, and silently took
+    the pure-SNR branch for -0.5 and the pure-L1 branch for 2.0."""
+    with pytest.raises(ValueError, match="l1_weight"):
         cls(name="t", l1_weight=bad)
 
 
-@needs_assertions
-def test_l1snr_loss_does_not_validate_l1_weight_yet():
-    """M14: L1SNRLoss is the only class without the range check, so out-of-range values pass silently.
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("good", [0.0, 0.5, 1.0])
+def test_l1_weight_endpoints_are_accepted(cls, good):
+    """The range is inclusive. Guards against validation that is too strict."""
+    assert cls(name="t", l1_weight=good) is not None
 
-    Pinned as current behaviour so A2 has something to flip. When A2 lands, this test is replaced by the
-    parametrized rejection test above extended to all four classes.
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0001, 1.5, 2.0])
+def test_spec_weight_out_of_range_is_rejected(bad):
+    """M19, the highest-priority correctness item.
+
+    forward computes (1 - spec_weight) * time_loss + spec_weight * spec_loss. Above 1 the time coefficient
+    goes negative, so the optimizer is rewarded for degrading waveform reconstruction: measured
+    spec_weight=1.5 giving a time coefficient of -0.5, with the loss becoming more negative as the
+    time-domain estimate got worse. The docstring said "set higher to emphasize spectral accuracy" with no
+    stated bound, actively inviting it.
     """
-    est, act = audio(2, 4096), audio(2, 4096, seed=1)
-    assert L1SNRLoss(name="t", l1_weight=-0.5)(est, act).ndim == 0   # takes the pure-SNR branch
-    assert L1SNRLoss(name="t", l1_weight=2.0)(est, act).ndim == 0    # takes the pure-L1 branch
+    with pytest.raises(ValueError, match="spec_weight"):
+        MultiL1SNRDBLoss(name="t", spec_weight=bad)
 
 
-@needs_assertions
+@pytest.mark.parametrize("good", [0.0, 0.5, 1.0])
+def test_spec_weight_endpoints_are_accepted(good):
+    assert MultiL1SNRDBLoss(name="t", spec_weight=good) is not None
+
+
+def test_time_coefficient_never_goes_negative():
+    """M19 stated as the invariant rather than the symptom: no accepted spec_weight may invert the sign."""
+    for sw in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        loss_fn = MultiL1SNRDBLoss(name="t", spec_weight=sw)
+        assert (1.0 - loss_fn.spec_weight) >= 0.0
+
+
 def test_mismatched_stft_parameter_list_lengths_are_rejected():
-    with pytest.raises(AssertionError, match="same length"):
+    with pytest.raises(ValueError, match="same length"):
         STFTL1SNRDBLoss(name="t", n_ffts=[512, 1024], hop_lengths=[128], win_lengths=[512, 1024])
 
 
-@needs_assertions
 def test_win_length_larger_than_n_fft_is_rejected():
-    with pytest.raises(AssertionError, match="FFT size"):
+    with pytest.raises(ValueError, match="win_length"):
         STFTL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[128], win_lengths=[1024])
 
 
-def test_unknown_window_fn_is_rejected():
-    """Q25: surfaces as an opaque AttributeError today. A12 turns it into a ValueError naming the options."""
-    with pytest.raises((AttributeError, ValueError)):
+def test_unknown_window_fn_is_rejected_with_the_valid_options():
+    """Q25/A12: surfaced as an opaque AttributeError about a mangled attribute name."""
+    with pytest.raises(ValueError) as exc:
         STFTL1SNRDBLoss(name="t", window_fn="blackman_harris")
+    message = str(exc.value)
+    for valid in ["hann", "hamming", "blackman", "bartlett", "kaiser"]:
+        assert valid in message, f"the error message does not name {valid!r} as a valid option"
+
+
+def test_validation_survives_python_O():
+    """M15: the checks must not be bare asserts, which python -O strips.
+
+    Asserted structurally as well as through the -O CI job, so the requirement is visible in the source.
+    """
+    src = (pathlib.Path(__file__).parent.parent / "torch_l1_snr" / "l1snr.py").read_text()
+    tree = ast.parse(src)
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in ("__init__",):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Assert):
+                    offenders.append(sub.lineno)
+    assert not offenders, (
+        f"__init__ still validates with bare assert at line(s) {offenders}; python -O would remove it")
 
 
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)

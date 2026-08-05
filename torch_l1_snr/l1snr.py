@@ -33,6 +33,38 @@ from torchaudio.transforms import Spectrogram
 import math
 from typing import Optional, List
 
+_WINDOW_FNS = ("hann", "hamming", "blackman", "bartlett", "kaiser")
+
+
+def _validate_unit_range(name, value):
+    """Reject a weight outside [0, 1] with a ValueError.
+
+    A ValueError rather than an assert: `python -O` strips assert statements, and an out-of-range weight then
+    produces a silently wrong loss instead of an error.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} must be a number between 0.0 and 1.0 inclusive, got {value!r}")
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must be between 0.0 and 1.0 inclusive, got {value}")
+
+
+def _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn):
+    if not (len(n_ffts) == len(hop_lengths) == len(win_lengths)):
+        raise ValueError(
+            f"n_ffts, hop_lengths and win_lengths must all have the same length, got "
+            f"{len(n_ffts)}, {len(hop_lengths)} and {len(win_lengths)}"
+        )
+    for n_fft, win_length in zip(n_ffts, win_lengths):
+        if win_length > n_fft:
+            raise ValueError(
+                f"win_length ({win_length}) must not exceed the FFT size ({n_fft})"
+            )
+    if window_fn not in _WINDOW_FNS:
+        raise ValueError(
+            f"window_fn must be one of {', '.join(_WINDOW_FNS)}, got {window_fn!r}"
+        )
+
+
 def dbrms(x, eps=1e-8):
     """
     Compute RMS level in decibels for a batch of signals.
@@ -84,6 +116,7 @@ class L1SNRLoss(torch.nn.Module):
         l1_weight: float = 0.0,
     ):
         super().__init__()
+        _validate_unit_range("l1_weight", l1_weight)
         self.name = name
         self.weight = weight
         self.eps = eps
@@ -193,8 +226,7 @@ class L1SNRDBLoss(torch.nn.Module):
         self.lmin = lmin
         self.use_regularization = use_regularization
 
-        # Validate l1_weight is between 0.0 and 1.0 inclusive
-        assert 0.0 <= l1_weight <= 1.0, "l1_weight must be between 0.0 and 1.0 inclusive"
+        _validate_unit_range("l1_weight", l1_weight)
         self.l1_weight = l1_weight
 
         # Initialize component losses based on l1_weight
@@ -328,7 +360,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         n_ffts (List[int]): List of FFT sizes for multi-resolution STFT analysis.
         hop_lengths (List[int]): List of hop lengths (STFT time steps) for each resolution.
         win_lengths (List[int]): List of window lengths for each resolution.
-        window_fn (str): Window function for the STFT ('hann', 'hamming', etc.)
+        window_fn (str): Window function for the STFT. One of 'hann', 'hamming', 'blackman',
+            'bartlett' or 'kaiser'; any other value raises ValueError.
         min_audio_length (int): Minimum audio length required for STFT processing. If audio is
             shorter, the loss falls back to a time-domain L1SNR computation rather than failing.
             Note that the fallback is a different objective: it returns a single time-domain D1
@@ -371,18 +404,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self.weight = weight
         self.min_audio_length = min_audio_length
 
-        # Validate STFT parameters
-        assert len(n_ffts) == len(hop_lengths) == len(win_lengths), "All STFT parameter lists must have the same length"
+        _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn)
 
         # Store STFT parameters for validation during forward pass
         self.n_ffts = n_ffts
         self.hop_lengths = hop_lengths
         self.win_lengths = win_lengths
         self.window_fn_name = window_fn
-
-        # Validate window sizes
-        for n_fft, win_length in zip(n_ffts, win_lengths):
-            assert n_fft >= win_length, f"FFT size ({n_fft}) must be greater than or equal to window length ({win_length})"
 
         # Pre-initialize Spectrogram transforms for maximum efficiency
         self.spectrogram_transforms = nn.ModuleList()
@@ -409,8 +437,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self.dbrms_eps = dbrms_eps
         self.l1snr_eps = l1snr_eps
 
-        # Add L1 loss parameters and validate
-        assert 0.0 <= l1_weight <= 1.0, "l1_weight must be between 0.0 and 1.0 inclusive"
+        _validate_unit_range("l1_weight", l1_weight)
         self.l1_weight = l1_weight
 
         # Flag for pure L1 mode
@@ -719,8 +746,15 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     Attributes:
         name (str): The name identifier for the loss.
         weight (float): The overall weight multiplier for the loss.
-        spec_weight (float): The weight for spectrogram domain loss relative to time domain.
-            Default 0.5 (equal weighting). Set higher to emphasize spectral accuracy.
+        spec_weight (float): Coefficient on the spectrogram-domain loss, in [0.0, 1.0]. The time
+            domain receives (1 - spec_weight). Values outside that range raise ValueError:
+            above 1.0 the time coefficient would be negative, which instructs the optimizer to
+            maximize time-domain error.
+            Default 0.5, which is the paper-faithful choice rather than merely "equal": it is the
+            value at which the time, real and imaginary terms all carry weight 0.5, reproducing
+            the 1:1:1 weighting of arXiv:2406.18747. Note this is a loss-value weight, not a
+            gradient share - spec_loss sums a real and an imaginary D1 term while time_loss is a
+            single term, so equal coefficients are not equal gradient contribution.
         use_time_regularization (bool): Whether to use level-matching regularization in time domain.
         use_spec_regularization (bool): Whether to use level-matching regularization in spectogram domain.
         l1_weight (float): Weight for the L1 loss component vs the L1SNR+reg components.
@@ -784,12 +818,14 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         mps_cpu_fallback: bool = True,
     ):
         super().__init__()
+        # spec_weight above 1 makes the time-domain coefficient (1 - spec_weight) negative in forward,
+        # instructing the optimizer to MAXIMISE time-domain error. Never leave this unvalidated.
+        _validate_unit_range("spec_weight", spec_weight)
         self.name = name
         self.weight = weight
         self.spec_weight = spec_weight
 
-        # Validate l1_weight is in valid range
-        assert 0.0 <= l1_weight <= 1.0, "l1_weight must be between 0.0 and 1.0 inclusive"
+        _validate_unit_range("l1_weight", l1_weight)
         self.l1_weight = l1_weight
         self.use_time_regularization = use_time_regularization
         self.use_spec_regularization = use_spec_regularization
