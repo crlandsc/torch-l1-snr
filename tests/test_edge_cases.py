@@ -142,15 +142,16 @@ def test_all_resolutions_failing_warns():
     loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
                               min_audio_length=16)
     est, act = audio(2, 600), audio(2, 600, seed=1)
-    with pytest.warns(UserWarning, match="All spectrogram transforms failed"):
+    with pytest.warns(RuntimeWarning, match="every spectrogram resolution failed"):
         loss = loss_fn(est, act)
     assert loss.item() == 0.0
 
 
-def test_all_resolutions_failing_returns_a_detached_zero_today():
-    """M6, pinned as current behaviour: .backward() raises because the zero carries no grad_fn.
+def test_all_resolutions_failing_returns_a_graph_connected_zero():
+    """M6/A6: the zero must stay attached to the graph, or .backward() raises outright.
 
-    A6 fixes this. When it lands, this test inverts to assert backward() succeeds.
+    Worse than the crash was the silent case: inside MultiL1SNRDBLoss the detached zero made the spectral
+    term contribute nothing with no error, so only the time term trained.
     """
     loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
                               min_audio_length=16)
@@ -158,26 +159,50 @@ def test_all_resolutions_failing_returns_a_detached_zero_today():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         loss = loss_fn(est, audio(2, 600, seed=1))
-    assert loss.grad_fn is None
-    with pytest.raises(RuntimeError, match="does not require grad"):
-        loss.backward()
+    assert loss.grad_fn is not None, "the zero is detached from the graph"
+    loss.backward()                                    # must not raise
+    assert est.grad is not None
+    assert est.grad.abs().max().item() == 0.0, "a zero loss should give a zero, not absent, gradient"
 
 
-def test_nan_input_is_scrubbed_without_warning_today():
-    """M7: an all-NaN estimate yields exactly 0.0 with an all-zero gradient and no warning at all.
+def test_multi_keeps_a_spectral_gradient_when_all_resolutions_fail():
+    """M6's silent case: inside Multi the detached zero meant only the time term trained, with no signal."""
+    loss_fn = MultiL1SNRDBLoss(name="t", n_ffts=[8192], hop_lengths=[8], win_lengths=[8192],
+                               min_audio_length=16, spec_weight=0.5)
+    est = audio(2, 600).requires_grad_(True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        loss = loss_fn(est, audio(2, 600, seed=1))
+    assert loss.requires_grad
+    loss.backward()
+    assert est.grad is not None
 
-    A diverged run therefore reports as healthy. A7 adds a one-shot warning; this test then becomes a
-    pytest.warns assertion. Pinned now so the silence is on the record.
-    """
+
+def test_nan_input_warns_exactly_once():
+    """M7/A7: an all-NaN estimate yields exactly 0.0 with an all-zero gradient, so a diverged run reports
+    as healthy. The scrubbing is deliberate; its silence was not."""
     loss_fn = STFTL1SNRDBLoss(name="t")
     est = torch.full((2, 4096), float("nan"), requires_grad=True)
     act = audio(2, 4096)
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")        # any warning at all would fail this
+    with pytest.warns(RuntimeWarning, match="non-finite"):
         loss = loss_fn(est, act)
     loss.backward()
     assert loss.item() == 0.0
     assert est.grad.abs().max().item() == 0.0
+
+    # one-shot, mirroring the existing _mps_warned pattern: a per-step warning would flood a training log
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        loss_fn(torch.full((2, 4096), float("nan")), act)
+
+
+def test_nan_warning_is_per_instance_not_global():
+    """A fresh loss object must warn again, or a second training run in the same process stays silent."""
+    act = audio(2, 4096)
+    nan = torch.full((2, 4096), float("nan"))
+    for _ in range(2):
+        with pytest.warns(RuntimeWarning, match="non-finite"):
+            STFTL1SNRDBLoss(name="t")(nan, act)
 
 
 def test_time_domain_losses_do_not_scrub_nan():
@@ -415,3 +440,88 @@ def test_time_and_spec_loss_params_override_the_shared_defaults():
     est, act = audio(2, 8192), audio(2, 8192, seed=1)
     plain = MultiL1SNRDBLoss(name="t", lmin=-60.0, use_time_regularization=True)
     assert loss_fn(est, act).item() != plain(est, act).item()
+
+
+# ---------------------------------------------------------------------------------------------
+# A4 -- shape equality
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_mismatched_shapes_with_equal_element_counts_are_rejected(cls):
+    """M9: reshape(batch_size, -1) made any two tensors agreeing in batch size and element count
+    comparable, so this returned a plausible 1.497 from a wrong pairing instead of complaining.
+
+    The dangerous case is exactly this one: equal element counts, different structure. A user who permutes
+    stems and channels, or feeds different durations, trains against a silently wrong pairing.
+    """
+    est = torch.randn(2, 4, 8000)
+    act = torch.randn(2, 2, 16000)
+    assert est.numel() == act.numel(), "the test premise is equal element counts"
+    with pytest.raises(ValueError, match="shape"):
+        cls(name="t")(est, act)
+
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_mismatched_durations_are_rejected(cls):
+    with pytest.raises(ValueError, match="shape"):
+        cls(name="t")(torch.randn(2, 16000), torch.randn(2, 8000))
+
+
+@pytest.mark.parametrize("shape", [(2, 4096), (2, 2, 4096), (2, 4, 2, 4096)])
+def test_matching_shapes_still_work(shape):
+    """A4 must only reject shapes that already differ. Every legitimate call is unaffected."""
+    est, act = audio(*shape), audio(*shape, seed=1)
+    for cls in ALL_CLASSES:
+        assert cls(name="t")(est, act).ndim == 0
+
+
+def test_per_stem_slicing_still_works_after_the_shape_check():
+    """The pattern the maintainer's training configs use: slice one stem, then call the loss."""
+    est, act = audio(2, 4, 2, 4096), audio(2, 4, 2, 4096, seed=1)
+    for k in range(4):
+        for cls in ALL_CLASSES:
+            assert cls(name="t")(est[:, k], act[:, k]).ndim == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# A11, A13
+# ---------------------------------------------------------------------------------------------
+
+def test_multi_warns_when_the_spectral_branch_falls_back():
+    """M21: below min_audio_length both branches compute the same time-domain quantity, so the user is
+    optimizing one domain at effective weight 1.0 while believing they have a multi-domain objective."""
+    est, act = audio(2, 400), audio(2, 400, seed=1)
+    with pytest.warns(RuntimeWarning, match="fall(ing|s)? back|short"):
+        MultiL1SNRDBLoss(name="t", min_audio_length=512)(est, act)
+
+
+def test_multi_does_not_warn_above_the_threshold():
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        MultiL1SNRDBLoss(name="t", min_audio_length=512)(est, act)
+
+
+@pytest.mark.parametrize("attr", ["n_ffts", "hop_lengths", "win_lengths"])
+def test_mutable_list_defaults_are_not_shared(attr):
+    """Q11: the default lists were stored by reference, so two instances aliased the same object and each
+    other's in-place mutation leaked across them.
+
+    Checked on STFTL1SNRDBLoss, the class that stores them. MultiL1SNRDBLoss does not keep its own copies --
+    it threads them to the spectral branch, which is covered separately below.
+    """
+    a, b = STFTL1SNRDBLoss(name="a"), STFTL1SNRDBLoss(name="b")
+    la, lb = getattr(a, attr), getattr(b, attr)
+    assert la is not lb, f"STFTL1SNRDBLoss.{attr} is shared between instances"
+    la.append(99999)
+    assert 99999 not in lb, f"mutating one instance's {attr} leaked into another"
+
+
+@pytest.mark.parametrize("attr", ["n_ffts", "hop_lengths", "win_lengths"])
+def test_multi_does_not_leak_lists_through_its_spectral_branch(attr):
+    """MultiL1SNRDBLoss passes the signature defaults down, so the leak has to be closed at the far end."""
+    a, b = MultiL1SNRDBLoss(name="a"), MultiL1SNRDBLoss(name="b")
+    la, lb = getattr(a.spec_loss, attr), getattr(b.spec_loss, attr)
+    assert la is not lb
+    la.append(99999)
+    assert 99999 not in lb

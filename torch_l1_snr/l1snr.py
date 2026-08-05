@@ -36,6 +36,20 @@ from typing import Optional, List
 _WINDOW_FNS = ("hann", "hamming", "blackman", "bartlett", "kaiser")
 
 
+def _validate_matching_shapes(estimates, actuals):
+    """Reject differing shapes before any reshape flattens the difference away.
+
+    Without this, reshape(batch_size, -1) makes any two tensors that agree in batch size and element count
+    compare successfully, so a permuted stem/channel axis or a duration mismatch trains against a silently
+    wrong pairing instead of raising.
+    """
+    if estimates.shape != actuals.shape:
+        raise ValueError(
+            f"estimates and actuals must have the same shape, got {tuple(estimates.shape)} and "
+            f"{tuple(actuals.shape)}"
+        )
+
+
 def _validate_unit_range(name, value):
     """Reject a weight outside [0, 1] with a ValueError.
 
@@ -123,6 +137,7 @@ class L1SNRLoss(torch.nn.Module):
         self.l1_weight = l1_weight
 
     def forward(self, estimates, actuals, *args, **kwargs):
+        _validate_matching_shapes(estimates, actuals)
         batch_size = estimates.shape[0]
 
         est_source = estimates.reshape(batch_size, -1)
@@ -272,6 +287,7 @@ class L1SNRDBLoss(torch.nn.Module):
         return lam.detach()  # Stop-gradient
 
     def forward(self, estimates, actuals, *args, **kwargs):
+        _validate_matching_shapes(estimates, actuals)
         batch_size = estimates.shape[0]
 
         est_source = estimates.reshape(batch_size, -1)
@@ -406,10 +422,11 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn)
 
-        # Store STFT parameters for validation during forward pass
-        self.n_ffts = n_ffts
-        self.hop_lengths = hop_lengths
-        self.win_lengths = win_lengths
+        # Copy: a list default is created once at function-definition time, so storing it by reference
+        # makes every instance alias the same object and leaks in-place mutation across them.
+        self.n_ffts = list(n_ffts)
+        self.hop_lengths = list(hop_lengths)
+        self.win_lengths = list(win_lengths)
         self.window_fn_name = window_fn
 
         # Pre-initialize Spectrogram transforms for maximum efficiency
@@ -470,6 +487,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # MPS CPU fallback for correct gradients
         self.mps_cpu_fallback = mps_cpu_fallback
         self._mps_warned = False
+        self._nan_warned = False
+        self._fallback_warned = False
 
         # Simplified tracking
         self.nan_inf_counts = {"inputs": 0, "spec_loss": 0}
@@ -585,12 +604,23 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         return True
 
     def forward(self, estimates, actuals, *args, **kwargs):
+        _validate_matching_shapes(estimates, actuals)
         device = estimates.device
         batch_size = estimates.shape[0]
 
-        # Basic NaN/Inf handling (simplified)
+        # Sanitize non-finite input. Deliberate, but it must not be silent: an all-NaN estimate otherwise
+        # yields exactly 0.0 with an all-zero gradient, so a diverged run looks healthy.
         if torch.isnan(estimates).any() or torch.isinf(estimates).any() or torch.isnan(actuals).any() or torch.isinf(actuals).any():
-            self.nan_inf_counts["inputs"] += 1
+            if not self._nan_warned:
+                warnings.warn(
+                    f"{self.name}: non-finite values (NaN or Inf) found in the loss input and replaced "
+                    "with zeros. The loss and its gradient are computed on the sanitized tensors, so a "
+                    "diverging model can produce a healthy-looking zero loss. This warning is issued once "
+                    "per loss instance; check your model and data if it appears.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._nan_warned = True
             estimates = torch.nan_to_num(estimates, nan=0.0, posinf=1.0, neginf=-1.0)
             actuals = torch.nan_to_num(actuals, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -600,7 +630,21 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Validate audio length
         audio_length = est_source.shape[-1]
         if not self._validate_audio_length(audio_length):
-            # Fallback to time-domain L1SNR-style loss instead of zero
+            # Fallback to a time-domain loss. This is a *different objective*, not a degraded version of the
+            # same one: it returns a single time-domain D1 where the STFT path sums a real and an imaginary
+            # term. Inside MultiL1SNRDBLoss it also makes both branches the same quantity, so the user is
+            # optimizing one domain at effective weight 1.0 while believing otherwise. Say so once.
+            if not self._fallback_warned:
+                warnings.warn(
+                    f"{self.name}: input length {audio_length} is below min_audio_length "
+                    f"({self.min_audio_length}), so the spectrogram loss is falling back to a time-domain "
+                    "computation. This is a different objective, roughly 2x smaller in magnitude, and "
+                    "inside MultiL1SNRDBLoss it makes the time and spectral branches identical. Warned "
+                    "once per loss instance.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._fallback_warned = True
             return self.fallback_time_loss(estimates, actuals, *args, **kwargs) * self.weight
 
         # MPS workaround: route STFT computation through CPU to avoid
@@ -686,10 +730,17 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                 warnings.warn(f"Runtime error in spectrogram transform {i}: {e}")
                 continue
 
-        # If all transforms failed, return zero loss
+        # If all transforms failed, return a zero that is still attached to the graph. A bare
+        # torch.tensor(0.0) has no grad_fn, so .backward() raises here and, worse, silently contributes
+        # nothing inside MultiL1SNRDBLoss while the time term goes on training.
         if valid_transforms == 0:
-            warnings.warn("All spectrogram transforms failed. Returning zero loss.")
-            return torch.tensor(0.0, device=device)
+            warnings.warn(
+                f"{self.name}: every spectrogram resolution failed, so the spectral loss is zero and "
+                "carries no learning signal. Check n_ffts against your input length.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return (est_source.sum() * 0.0).to(device) * self.weight
 
         # Average losses across valid transforms
         avg_spec_loss = total_spec_loss / valid_transforms
@@ -889,6 +940,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         Returns:
             Combined weighted loss from time and spectrogram domains
         """
+        _validate_matching_shapes(estimates, actuals)
         # Compute time domain loss
         time_loss = self.time_loss(estimates, actuals, *args, **kwargs)
 
