@@ -1,6 +1,11 @@
+import ast
+import pathlib
+
 import torch
 import pytest
 from typing import Optional
+
+import reference
 from torch_l1_snr import (
     dbrms,
     L1SNRLoss,
@@ -66,6 +71,7 @@ def dummy_stems_4d():
 
 # --- Test Functions ---
 
+@pytest.mark.no_forward  # exercises dbrms(), which is not one of the four forward() methods
 def test_dbrms():
     signal = torch.ones(2, 1000) * 0.1
     # RMS of 0.1 is -20 dB
@@ -79,11 +85,11 @@ def test_l1snr_loss(dummy_audio):
     estimates, actuals = dummy_audio
     loss_fn = L1SNRLoss(name="test")
     loss = loss_fn(estimates, actuals)
-    
+
     assert isinstance(loss, torch.Tensor)
     assert loss.ndim == 0
-    assert not torch.isnan(loss)
-    assert not torch.isinf(loss)
+    # A value assertion, not just isnan/isinf: those are satisfied by any constant.
+    assert torch.allclose(loss, reference.l1snr(estimates, actuals), atol=1e-6)
 
 def test_l1snrdb_loss_time(dummy_audio):
     estimates, actuals = dummy_audio
@@ -119,19 +125,23 @@ def test_stft_l1snrdb_loss(dummy_audio):
     # Test with default settings
     loss_fn = STFTL1SNRDBLoss(name="test", l1_weight=0.0)
     loss = loss_fn(estimates, actuals)
-    assert loss.ndim == 0 and not torch.isnan(loss) and not torch.isinf(loss)
-    
+    assert loss.ndim == 0
+    assert torch.allclose(loss, reference.multi_res_spec_d1(estimates, actuals), atol=1e-5)
+
     # Test pure L1 mode
     loss_fn_pure_l1 = STFTL1SNRDBLoss(name="test_pure_l1", l1_weight=1.0)
     l1_loss = loss_fn_pure_l1(estimates, actuals)
-    assert l1_loss.ndim == 0 and not torch.isnan(l1_loss) and not torch.isinf(l1_loss)
+    assert torch.allclose(l1_loss, reference.multi_res_spec_d1(estimates, actuals, l1_weight=1.0),
+                          atol=1e-6)
 
-    # Test with very short audio
+    # Below min_audio_length=512 the loss falls back to a time-domain computation, not zero (M16)
     short_estimates = estimates[:, :500]
     short_actuals = actuals[:, :500]
     loss_short = loss_fn(short_estimates, short_actuals)
-    # min_audio_length is 512, so this should fallback to time-domain loss
-    assert loss_short.ndim == 0 and not torch.isnan(loss_short)
+    assert loss_short.item() != 0.0
+    assert torch.allclose(loss_short,
+                          reference.l1snr_db(short_estimates, short_actuals, use_regularization=False),
+                          atol=1e-6)
 
 def test_stem_multi_loss(dummy_stems):
     estimates, actuals = dummy_stems
@@ -146,7 +156,10 @@ def test_stem_multi_loss(dummy_stems):
         l1_weight=0.1
     )
     loss = loss_fn_stem(est_stem, act_stem)
-    assert loss.ndim == 0 and not torch.isnan(loss)
+    assert loss.ndim == 0
+    assert torch.allclose(loss, 0.5 * reference.l1snr_db(est_stem, act_stem, l1_weight=0.1)
+                                + 0.5 * reference.multi_res_spec_d1(est_stem, act_stem, l1_weight=0.1),
+                          atol=1e-5)
 
     # Test with all stems jointly - flatten all stems together
     # Reshape to [batch, -1] to process all stems at once
@@ -158,14 +171,17 @@ def test_stem_multi_loss(dummy_stems):
         l1_weight=0.1
     )
     loss_all = loss_fn_all(est_all, act_all)
-    assert loss_all.ndim == 0 and not torch.isnan(loss_all)
-    
-    # Test pure L1 mode on all stems
+    assert torch.allclose(loss_all, 0.5 * reference.l1snr_db(est_all, act_all, l1_weight=0.1)
+                                    + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=0.1),
+                          atol=1e-5)
+
+    # Pure L1 mode on all stems. The reference now covers the spectrogram L1 endpoint, so this is a value
+    # assertion rather than the isnan check it used to be.
     loss_fn_l1 = MultiL1SNRDBLoss(name="l1_only", l1_weight=1.0)
     l1_loss = loss_fn_l1(est_all, act_all)
-    
-    # Can't easily compute multi-res STFT L1 here, but can check it's not nan
-    assert l1_loss.ndim == 0 and not torch.isnan(l1_loss)
+    assert torch.allclose(l1_loss, 0.5 * reference.l1snr_db(est_all, act_all, l1_weight=1.0)
+                                   + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=1.0),
+                          atol=1e-5)
 
 @pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
 def test_loss_variants(dummy_audio, l1_weight):
@@ -174,375 +190,162 @@ def test_loss_variants(dummy_audio, l1_weight):
     
     time_loss_fn = L1SNRDBLoss(name=f"test_time_{l1_weight}", l1_weight=l1_weight)
     time_loss = time_loss_fn(estimates, actuals)
-    assert not torch.isnan(time_loss) and not torch.isinf(time_loss)
+    assert torch.allclose(time_loss, reference.l1snr_db(estimates, actuals, l1_weight=l1_weight),
+                          atol=1e-6)
 
     spec_loss_fn = STFTL1SNRDBLoss(name=f"test_spec_{l1_weight}", l1_weight=l1_weight)
     spec_loss = spec_loss_fn(estimates, actuals)
-    assert not torch.isnan(spec_loss) and not torch.isinf(spec_loss)
+    assert torch.allclose(spec_loss, reference.multi_res_spec_d1(estimates, actuals,
+                                                                l1_weight=l1_weight), atol=1e-5)
 
 # --- Wrapper-Paradigm Tests ---
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-def test_l1snr_wrapper_all_stems_3d(dummy_stems_3d, l1_weight):
-    """Test L1SNRLoss wrapper with stem_dimension=None on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = L1SNRLoss(name="test", weight=1.0, l1_weight=l1_weight)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+# --- Wrapper Tests: compared against an independent reference, never against base_loss ---
+#
+# Audit finding M2. These tests previously asserted
+#     wrapped_loss(est, act) == base_loss(est, act)                       (stem_dimension=None)
+#     wrapped_loss(est, act) == base_loss(est[:, k], act[:, k])           (stem_dimension=k)
+# Both are structurally f(x) == f(x), because that is exactly what StemWrappedLoss.forward does. They could
+# not fail for any implementation of f, and 112 of the suite's 127 cases were of this form: stubbing all four
+# forward() methods to a constant left 122 of 127 passing.
+#
+# They now compare against tests/reference.py, which is derived from the definitions, imports nothing from
+# torch_l1_snr, and is itself validated against hand-computed values (see test_reference_matches_hand_arithmetic).
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-def test_l1snr_wrapper_all_stems_4d(dummy_stems_4d, l1_weight):
-    """Test L1SNRLoss wrapper with stem_dimension=None on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = L1SNRLoss(name="test", weight=1.0, l1_weight=l1_weight)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+REF_BY_CLASS = {
+    "L1SNRLoss": lambda est, act, **kw: reference.l1snr_blended(
+        est, act, l1_weight=kw["l1_weight"]),
+    "L1SNRDBLoss": lambda est, act, **kw: reference.l1snr_db(
+        est, act, l1_weight=kw["l1_weight"], use_regularization=kw["use_reg"]),
+    "STFTL1SNRDBLoss": lambda est, act, **kw: reference.multi_res_spec_d1(
+        est, act, l1_weight=kw["l1_weight"]),
+    "MultiL1SNRDBLoss": lambda est, act, **kw: (
+        0.5 * reference.l1snr_db(est, act, l1_weight=kw["l1_weight"],
+                                 use_regularization=kw["use_reg"])
+        + 0.5 * reference.multi_res_spec_d1(est, act, l1_weight=kw["l1_weight"])),
+}
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_l1snr_wrapper_single_stem_3d(dummy_stems_3d, l1_weight, stem_idx):
-    """Test L1SNRLoss wrapper with stem_dimension=k on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = L1SNRLoss(name="test", weight=1.0, l1_weight=l1_weight)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :]
-    act_slice = actuals[:, stem_idx, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_l1snr_wrapper_single_stem_4d(dummy_stems_4d, l1_weight, stem_idx):
-    """Test L1SNRLoss wrapper with stem_dimension=k on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = L1SNRLoss(name="test", weight=1.0, l1_weight=l1_weight)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :, :]
-    act_slice = actuals[:, stem_idx, :, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+def _build(cls_name, l1_weight, use_reg):
+    if cls_name == "L1SNRLoss":
+        return L1SNRLoss(name="t", weight=1.0, l1_weight=l1_weight)
+    if cls_name == "L1SNRDBLoss":
+        return L1SNRDBLoss(name="t", weight=1.0, l1_weight=l1_weight, use_regularization=use_reg)
+    if cls_name == "STFTL1SNRDBLoss":
+        return STFTL1SNRDBLoss(name="t", weight=1.0, l1_weight=l1_weight, use_regularization=False)
+    return MultiL1SNRDBLoss(name="t", weight=1.0, spec_weight=0.5, l1_weight=l1_weight,
+                            use_time_regularization=use_reg, use_spec_regularization=False)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_reg", [True, False])
-def test_l1snrdb_wrapper_all_stems_3d(dummy_stems_3d, l1_weight, use_reg):
-    """Test L1SNRDBLoss wrapper with stem_dimension=None on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = L1SNRDBLoss(name="test", weight=1.0, l1_weight=l1_weight, use_regularization=use_reg)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
 
+@pytest.mark.no_forward  # structural AST check, calls no library code
+def test_reference_module_does_not_import_the_library():
+    """A reference that calls the code under test is not a reference. Guard it structurally.
+
+    Walks the AST rather than grepping the source: the module's own docstring says it must not import
+    torch_l1_snr, and a substring check flags that sentence as a violation.
+    """
+    tree = ast.parse((pathlib.Path(__file__).parent / "reference.py").read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    assert "torch_l1_snr" not in imported, (
+        f"tests/reference.py imports the library under test; it imports {sorted(imported)}")
+
+
+@pytest.mark.no_forward  # validates the reference itself, not the library
+@pytest.mark.parametrize("act,est,expected", reference.HAND_CASES_D1)
+def test_reference_d1_matches_hand_arithmetic(act, est, expected):
+    """The reference is trustworthy because it reproduces arithmetic that can be redone on paper."""
+    got = reference.d1_per_element(torch.tensor(est), torch.tensor(act))
+    assert got.shape == (1,)
+    assert abs(got.item() - expected) < 1e-4, f"reference D1 = {got.item()}, hand-derived {expected}"
+
+
+@pytest.mark.no_forward  # validates the reference itself, not the library
+@pytest.mark.parametrize("x,expected", reference.HAND_CASES_DBRMS)
+def test_reference_dbrms_matches_hand_arithmetic(x, expected):
+    got = reference.dbrms(torch.tensor(x))
+    assert abs(got.item() - expected) < 1e-4, f"reference dbrms = {got.item()}, hand-derived {expected}"
+
+
+@pytest.mark.parametrize("cls_name", ["L1SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"])
+@pytest.mark.parametrize("ndim", [3, 4])
+@pytest.mark.parametrize("stem_idx", [None, 0, 3])
 @pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("use_reg", [True, False])
-def test_l1snrdb_wrapper_all_stems_4d(dummy_stems_4d, l1_weight, use_reg):
-    """Test L1SNRDBLoss wrapper with stem_dimension=None on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = L1SNRDBLoss(name="test", weight=1.0, l1_weight=l1_weight, use_regularization=use_reg)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+def test_wrapper_matches_independent_reference(cls_name, ndim, stem_idx, l1_weight, use_reg):
+    """StemWrappedLoss output must equal an independently computed value, not base_loss's own output."""
+    torch.manual_seed(0)
+    shape = (2, 4, 4096) if ndim == 3 else (2, 4, 1, 4096)
+    actuals = torch.randn(*shape) * 0.05
+    estimates = actuals + torch.randn(*shape) * 0.005
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_reg", [True, False])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_l1snrdb_wrapper_single_stem_3d(dummy_stems_3d, l1_weight, use_reg, stem_idx):
-    """Test L1SNRDBLoss wrapper with stem_dimension=k on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = L1SNRDBLoss(name="test", weight=1.0, l1_weight=l1_weight, use_regularization=use_reg)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :]
-    act_slice = actuals[:, stem_idx, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+    # Argument order matters: D1's denominator is mean|act|, so the reference is not symmetric in its
+    # two arguments. Passing them the wrong way round is a mistake this test caught during development.
+    est_in = estimates[:, stem_idx] if stem_idx is not None else estimates
+    act_in = actuals[:, stem_idx] if stem_idx is not None else actuals
+    expected = REF_BY_CLASS[cls_name](est_in, act_in, l1_weight=l1_weight, use_reg=use_reg)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_reg", [True, False])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_l1snrdb_wrapper_single_stem_4d(dummy_stems_4d, l1_weight, use_reg, stem_idx):
-    """Test L1SNRDBLoss wrapper with stem_dimension=k on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = L1SNRDBLoss(name="test", weight=1.0, l1_weight=l1_weight, use_regularization=use_reg)
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :, :]
-    act_slice = actuals[:, stem_idx, :, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+    wrapped = StemWrappedLoss(_build(cls_name, l1_weight, use_reg), stem_dimension=stem_idx)
+    got = wrapped(estimates, actuals)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-def test_stft_wrapper_all_stems_3d(dummy_stems_3d, l1_weight):
-    """Test STFTL1SNRDBLoss wrapper with stem_dimension=None on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+    assert got.ndim == 0
+    assert torch.allclose(got, expected, atol=1e-5), (
+        f"{cls_name} ndim={ndim} stem={stem_idx} w={l1_weight} reg={use_reg}: "
+        f"library {got.item():.7f} vs independent reference {expected.item():.7f}")
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-def test_stft_wrapper_all_stems_4d(dummy_stems_4d, l1_weight):
-    """Test STFTL1SNRDBLoss wrapper with stem_dimension=None on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_stft_wrapper_single_stem_3d(dummy_stems_3d, l1_weight, stem_idx):
-    """Test STFTL1SNRDBLoss wrapper with stem_dimension=k on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :]
-    act_slice = actuals[:, stem_idx, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+@pytest.mark.parametrize("ndim", [3, 4])
+def test_wrapper_distinguishes_between_stems(ndim):
+    """A wrapper that ignored stem_dimension would pass every test above; this one catches it.
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_stft_wrapper_single_stem_4d(dummy_stems_4d, l1_weight, stem_idx):
-    """Test STFTL1SNRDBLoss wrapper with stem_dimension=k on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :, :]
-    act_slice = actuals[:, stem_idx, :, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+    Each stem is given a deliberately different level, so slicing the wrong index gives a different loss.
+    """
+    torch.manual_seed(0)
+    shape = (2, 4, 4096) if ndim == 3 else (2, 4, 1, 4096)
+    actuals = torch.randn(*shape) * 0.05
+    for k in range(4):
+        actuals[:, k] *= (10.0 ** k)      # 0, 20, 40, 60 dB apart
+    estimates = actuals + torch.randn(*shape) * 0.005
 
-def test_stft_wrapper_short_audio_3d():
-    """Test STFTL1SNRDBLoss wrapper fallback path with short audio [B,S,T]."""
-    estimates = torch.randn(2, 4, 400)  # Short audio
-    actuals = torch.randn(2, 4, 400)
-    actuals[:, 0, :100] += 0.1
-    
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=0.0,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=512
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+    base = L1SNRLoss(name="t")
+    per_stem = [StemWrappedLoss(base, stem_dimension=k)(estimates, actuals).item() for k in range(4)]
+    assert len(set(round(v, 5) for v in per_stem)) == 4, (
+        f"per-stem losses are not distinct, so stem_dimension may be ignored: {per_stem}")
 
-def test_stft_wrapper_short_audio_4d():
-    """Test STFTL1SNRDBLoss wrapper fallback path with short audio [B,S,C,T]."""
-    estimates = torch.randn(2, 4, 1, 400)  # Short audio
-    actuals = torch.randn(2, 4, 1, 400)
-    actuals[:, 0, :, :100] += 0.1
-    
-    base_loss = STFTL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=0.0,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=512
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_time_reg", [True, False])
-def test_multi_wrapper_all_stems_3d(dummy_stems_3d, l1_weight, use_time_reg):
-    """Test MultiL1SNRDBLoss wrapper with stem_dimension=None on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        use_time_regularization=use_time_reg, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+def test_stft_wrapper_short_audio_falls_back_not_zero():
+    """M16: below min_audio_length the STFT loss returns a time-domain fallback, not zero."""
+    torch.manual_seed(0)
+    actuals = torch.randn(2, 4, 400) * 0.05
+    estimates = actuals + torch.randn(2, 4, 400) * 0.005
+    loss = STFTL1SNRDBLoss(name="t", l1_weight=0.0)(estimates, actuals)
+    assert loss.ndim == 0
+    assert loss.item() != 0.0, "short audio must not return a zero loss"
+    # the fallback is a time-domain L1SNRDBLoss with regularization off
+    expected = reference.l1snr_db(estimates, actuals, use_regularization=False)
+    assert torch.allclose(loss, expected, atol=1e-5)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_time_reg", [True, False])
-def test_multi_wrapper_all_stems_4d(dummy_stems_4d, l1_weight, use_time_reg):
-    """Test MultiL1SNRDBLoss wrapper with stem_dimension=None on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        use_time_regularization=use_time_reg, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
 
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_time_reg", [True, False])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_multi_wrapper_single_stem_3d(dummy_stems_3d, l1_weight, use_time_reg, stem_idx):
-    """Test MultiL1SNRDBLoss wrapper with stem_dimension=k on [B,S,T]."""
-    estimates, actuals = dummy_stems_3d
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        use_time_regularization=use_time_reg, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :]
-    act_slice = actuals[:, stem_idx, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
-
-@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
-@pytest.mark.parametrize("use_time_reg", [True, False])
-@pytest.mark.parametrize("stem_idx", [0, 3])
-def test_multi_wrapper_single_stem_4d(dummy_stems_4d, l1_weight, use_time_reg, stem_idx):
-    """Test MultiL1SNRDBLoss wrapper with stem_dimension=k on [B,S,C,T]."""
-    estimates, actuals = dummy_stems_4d
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=l1_weight,
-        use_time_regularization=use_time_reg, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=stem_idx)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    est_slice = estimates[:, stem_idx, :, :]
-    act_slice = actuals[:, stem_idx, :, :]
-    direct_result = base_loss(est_slice, act_slice)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
-
-def test_multi_wrapper_short_audio_3d():
-    """Test MultiL1SNRDBLoss wrapper fallback path with short audio [B,S,T]."""
-    estimates = torch.randn(2, 4, 400)  # Short audio
-    actuals = torch.randn(2, 4, 400)
-    actuals[:, 0, :100] += 0.1
-    
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=0.0,
-        use_time_regularization=True, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=512
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
-
-def test_multi_wrapper_short_audio_4d():
-    """Test MultiL1SNRDBLoss wrapper fallback path with short audio [B,S,C,T]."""
-    estimates = torch.randn(2, 4, 1, 400)  # Short audio
-    actuals = torch.randn(2, 4, 1, 400)
-    actuals[:, 0, :, :100] += 0.1
-    
-    base_loss = MultiL1SNRDBLoss(
-        name="test", weight=1.0, l1_weight=0.0,
-        use_time_regularization=True, use_spec_regularization=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=512
-    )
-    wrapped_loss = StemWrappedLoss(base_loss, stem_dimension=None)
-    
-    wrapped_result = wrapped_loss(estimates, actuals)
-    direct_result = base_loss(estimates, actuals)
-    
-    assert torch.allclose(wrapped_result, direct_result, atol=1e-6)
-    assert wrapped_result.ndim == 0
-    assert not torch.isnan(wrapped_result) and not torch.isinf(wrapped_result)
+def test_multi_short_audio_collapses_to_time_domain():
+    """M21: below min_audio_length both branches of MultiL1SNRDBLoss are the same time-domain quantity."""
+    torch.manual_seed(0)
+    actuals = torch.randn(2, 400) * 0.05
+    estimates = actuals + torch.randn(2, 400) * 0.005
+    loss_fn = MultiL1SNRDBLoss(name="t", spec_weight=0.5, use_time_regularization=False,
+                               use_spec_regularization=False)
+    combined = loss_fn(estimates, actuals)
+    time_only = loss_fn.time_loss(estimates, actuals)
+    spec_only = loss_fn.spec_loss(estimates, actuals)
+    assert torch.allclose(time_only, spec_only, atol=1e-6), (
+        "documented behaviour: the spectral branch falls back to the same time-domain loss")
+    assert torch.allclose(combined, time_only, atol=1e-6)
+    # Cross-branch equality alone is satisfied by any constant, so pin the absolute value too.
+    assert torch.allclose(combined, reference.l1snr_db(estimates, actuals, use_regularization=False),
+                          atol=1e-6)
 
 
 # --- Gradient Behavior Tests ---
@@ -635,93 +438,103 @@ def test_stft_gradient_distinction():
     assert ratio_l1 < ratio_snr, f"STFT L1 should have more uniform gradients"
 
 
-def test_mps_cpu_fallback_gradient_correctness():
-    """
-    Verify mps_cpu_fallback produces correct gradients by comparing
-    CPU-with-fallback vs CPU-without-fallback (should be identical).
-    On MPS, also verify gradients are finite and reasonably scaled.
+# --- MPS fallback (T1-9) ---
+#
+# The previous tests here could not detect the bug they guard, for two independent reasons (G2, and a second
+# found while re-verifying the upstream reproducer):
+#   1. On CPU they compared mps_cpu_fallback=True against False. The fallback is a no-op off MPS, so that is
+#      a CPU-vs-CPU comparison and passes whatever MPS does.
+#   2. Their MPS branch used 4096 samples. torch.stft backward on MPS is *correct* at that size -- it only
+#      fails above 65,536 -- so even on Apple silicon the test exercised a working path.
+#
+# These use a size where MPS is measurably wrong (264,600 samples, i.e. 6 s at 44.1 kHz, at batch 2) and skip
+# entirely without MPS rather than degenerating into a tautology. See PYTORCH_BUG_REPORT.md.
+
+MPS_FAILING_LENGTH = 264600      # not a multiple of 65536, so MPS backward is wrong here
+MPS_FAILING_BATCH = 2
+
+
+requires_mps = pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="needs MPS hardware; skipped rather than degenerating to a CPU-vs-CPU comparison",
+)
+
+
+@requires_mps
+def test_mps_fallback_gradients_match_cpu_at_a_failing_size():
+    """With the fallback on, MPS gradients must match CPU at a size where raw MPS stft backward is wrong."""
+    torch.manual_seed(42)
+    actuals = torch.randn(MPS_FAILING_BATCH, MPS_FAILING_LENGTH) * 0.1
+    estimates = actuals + 0.01 * torch.randn_like(actuals)
+
+    def run(device, fallback):
+        est = estimates.clone().to(device).requires_grad_(True)
+        act = actuals.clone().to(device)
+        loss_fn = STFTL1SNRDBLoss("t", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+                                  mps_cpu_fallback=fallback).to(device)
+        loss = loss_fn(est, act)
+        loss.backward()
+        return loss.detach().cpu(), est.grad.detach().cpu()
+
+    cpu_loss, cpu_grad = run("cpu", False)
+    fb_loss, fb_grad = run("mps", True)
+
+    assert torch.allclose(cpu_loss, fb_loss, atol=1e-4), (
+        f"fallback loss {fb_loss.item():.7f} != CPU {cpu_loss.item():.7f}")
+    ratio = fb_grad.norm().item() / cpu_grad.norm().item()
+    assert abs(ratio - 1.0) < 1e-3, (
+        f"fallback gradient norm ratio vs CPU is {ratio:.6f}, expected 1.0")
+
+
+@requires_mps
+@pytest.mark.no_forward  # probes torch.stft directly; deliberately independent of this library
+def test_raw_mps_is_actually_wrong_at_this_size():
+    """The fallback test above is only meaningful if MPS is genuinely broken here. Assert that it is.
+
+    This is the guard against the failure mode that made the old tests useless: a fallback test passes
+    trivially if the path it bypasses was never broken. If PyTorch fixes the bug this test starts failing,
+    which is the signal to re-enable MPS (T4-6) rather than a regression.
     """
     torch.manual_seed(42)
-    actuals = torch.randn(2, 4096)
-    estimates = actuals.clone() + 0.1 * torch.randn_like(actuals)
+    actuals = torch.randn(MPS_FAILING_BATCH, MPS_FAILING_LENGTH) * 0.1
+    estimates = actuals + 0.01 * torch.randn_like(actuals)
 
-    # CPU reference (fallback has no effect on CPU)
-    est_ref = estimates.clone().requires_grad_(True)
-    loss_fn_ref = STFTL1SNRDBLoss(
-        "ref", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
-        mps_cpu_fallback=False,
-    )
-    loss_ref = loss_fn_ref(est_ref, actuals)
-    loss_ref.backward()
+    def raw(device):
+        est = estimates.clone().to(device).requires_grad_(True)
+        w = torch.hann_window(512, device=device)
+        S = torch.stft(est.to(device), 512, 128, 512, w, center=True, pad_mode="reflect",
+                       normalized=False, onesided=True, return_complex=True)
+        S.real.abs().mean().backward()
+        return est.grad.detach().cpu()
 
-    # CPU with fallback enabled (should be identical since not on MPS)
-    est_fb = estimates.clone().requires_grad_(True)
-    loss_fn_fb = STFTL1SNRDBLoss(
-        "fb", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
-        mps_cpu_fallback=True,
-    )
-    loss_fb = loss_fn_fb(est_fb, actuals)
-    loss_fb.backward()
-
-    # Losses and gradients should be identical on CPU regardless of fallback flag
-    assert torch.allclose(loss_ref, loss_fb, atol=1e-6), \
-        f"Fallback should not change CPU loss: {loss_ref.item()} vs {loss_fb.item()}"
-    assert torch.allclose(est_ref.grad, est_fb.grad, atol=1e-6), \
-        "Fallback should not change CPU gradients"
-
-    # If MPS is available, verify the fallback produces finite, sane gradients
-    if torch.backends.mps.is_available():
-        mps = torch.device("mps")
-        est_mps = estimates.clone().to(mps).requires_grad_(True)
-        act_mps = actuals.clone().to(mps)
-        loss_fn_mps = STFTL1SNRDBLoss(
-            "mps", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
-            mps_cpu_fallback=True,
-        ).to(mps)
-        loss_mps = loss_fn_mps(est_mps, act_mps)
-        loss_mps.backward()
-
-        assert not torch.isnan(est_mps.grad).any(), "MPS fallback grads should have no NaN"
-        assert not torch.isinf(est_mps.grad).any(), "MPS fallback grads should have no Inf"
-        # Grad norm should be in a reasonable range (CPU ref norm as baseline)
-        cpu_norm = est_ref.grad.norm().item()
-        mps_norm = est_mps.grad.cpu().norm().item()
-        ratio = mps_norm / (cpu_norm + 1e-12)
-        assert 0.1 < ratio < 10.0, \
-            f"MPS fallback grad norm ({mps_norm:.4f}) should be close to CPU ({cpu_norm:.4f}), ratio={ratio:.2f}"
+    ratio = raw("mps").norm().item() / raw("cpu").norm().item()
+    assert abs(ratio - 1.0) > 1e-2, (
+        f"raw MPS stft backward now agrees with CPU (ratio {ratio:.6f}). If upstream fixed this, "
+        f"mps_cpu_fallback can be version-gated -- see T4-6 and PYTORCH_BUG_REPORT.md.")
 
 
-def test_mps_cpu_fallback_disabled():
-    """Verify mps_cpu_fallback=False skips the CPU routing."""
+def test_mps_fallback_is_a_noop_off_mps():
+    """Off MPS the flag must not change anything. Pinned against the reference, not against itself."""
     torch.manual_seed(42)
-    estimates = torch.randn(2, 4096)
-    actuals = torch.randn(2, 4096)
-
-    loss_fn = STFTL1SNRDBLoss(
-        "test", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
-        mps_cpu_fallback=False,
-    )
-    # On CPU this should just work normally
-    est = estimates.clone().requires_grad_(True)
-    loss = loss_fn(est, actuals)
-    loss.backward()
-    assert not torch.isnan(loss)
-    assert est.grad is not None
+    actuals = torch.randn(2, 4096) * 0.1
+    estimates = actuals + 0.01 * torch.randn_like(actuals)
+    expected = reference.spec_blended(estimates, actuals, 512, 128, 512)
+    for fallback in (True, False):
+        est = estimates.clone().requires_grad_(True)
+        loss = STFTL1SNRDBLoss("t", n_ffts=[512], hop_lengths=[128], win_lengths=[512],
+                               mps_cpu_fallback=fallback)(est, actuals)
+        loss.backward()
+        assert torch.allclose(loss, expected, atol=1e-6), f"fallback={fallback} changed the CPU result"
+        assert est.grad is not None
 
 
-def test_multi_mps_cpu_fallback_passthrough():
-    """Verify MultiL1SNRDBLoss passes mps_cpu_fallback to STFTL1SNRDBLoss."""
-    loss_fn = MultiL1SNRDBLoss(
-        "test", mps_cpu_fallback=True,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256,
-    )
-    assert loss_fn.spec_loss.mps_cpu_fallback is True
-
-    loss_fn_off = MultiL1SNRDBLoss(
-        "test", mps_cpu_fallback=False,
-        n_ffts=[256], hop_lengths=[64], win_lengths=[256], min_audio_length=256,
-    )
-    assert loss_fn_off.spec_loss.mps_cpu_fallback is False
+@pytest.mark.no_forward  # inspects a constructor attribute; never calls forward()
+def test_multi_passes_mps_flag_to_spectrogram_branch():
+    """MultiL1SNRDBLoss must thread mps_cpu_fallback through to the branch that needs it."""
+    for flag in (True, False):
+        loss_fn = MultiL1SNRDBLoss("t", mps_cpu_fallback=flag, n_ffts=[256], hop_lengths=[64],
+                                   win_lengths=[256], min_audio_length=256)
+        assert loss_fn.spec_loss.mps_cpu_fallback is flag
 
 
 def test_stft_l1_weight_interpolation():
