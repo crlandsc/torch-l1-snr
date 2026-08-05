@@ -6,26 +6,39 @@
 
 Read this section before upgrading.
 
-**What happens at the default `l1_weight=0.0`.** All four losses return **bit-identical loss values** to
-0.1.x. **Gradients are not bit-identical** in the two spectrogram classes, nor in `L1SNRDBLoss` with
-regularization enabled, because of the window-normalization fold and the `dbrms` epsilon cleanup described
-further down. The size of the gradient difference depends on how close your estimate already is to the
-target, and it is not small near convergence:
+**What happens at the default `l1_weight=0.0`.** Two losses are bit-identical to 0.1.x and two are not:
 
-| relative error of the estimate | gradient difference (relative L2) |
-|---|---|
-| 10% | 9e-08 |
-| 1% | 1e-03 |
-| 0.1% | 5e-03 |
-| 0.01% | 1e-02 |
-| 0.001% | 5e-02 |
+| loss | loss value | gradients |
+|---|---|---|
+| `L1SNRLoss` | bit-identical | bit-identical |
+| `L1SNRDBLoss(use_regularization=False)` | bit-identical | bit-identical |
+| `L1SNRDBLoss(use_regularization=True)` | differs, up to 1.1e-07 relative | differs |
+| `STFTL1SNRDBLoss`, `MultiL1SNRDBLoss` | differs, up to 2.2e-07 relative | differs |
+
+Two changes cause it: the window-normalization fold, and the `dbrms` epsilon cleanup, both described below.
+Loss values move at float32 rounding, so a comparison to six significant figures will match and one to full
+precision will not.
+
+Gradients move considerably more, and by an amount that depends both on how converged your estimate is and
+on how large your tensors are. Relative L2 difference:
+
+| relative error of the estimate | small tensors (< 1e5 elements) | realistic training shapes |
+|---|---|---|
+| 10% | 1e-07 | **5e-04** |
+| 1% | 1e-03 | 1e-03 |
+| 0.1% | 5e-03 | 5e-03 |
+| 0.001% | 5e-02 | 5e-02 |
 
 The mechanism is not instability introduced here. `torch.abs` has a discontinuous subgradient at zero, so
 when a residual bin sits near zero a last-bit change flips its sign and moves that element's gradient by its
-full magnitude. Perturbing 0.1.x's own window by a single floating-point step produces a difference of the
-same order, so this sensitivity is a property of an L1 objective near convergence rather than of this
-release. It is far below the gradient noise of minibatch training, but if you are diffing gradients to
-validate the upgrade, diff them at 10% error rather than at convergence, and expect the table above.
+full magnitude. More elements means more bins near zero, which is why the effect grows with tensor size.
+Perturbing 0.1.x's own window by a single floating-point step produces a difference of the same order, so
+this is a property of an L1 objective rather than of this release, and it is far below the gradient noise of
+minibatch training.
+
+**If you are diffing to validate the upgrade, compare loss values, not gradients.** Loss values differ only
+at float32 rounding on every path; gradients differ by ~5e-04 relative at a realistic batch shape even at
+10% error, so a strict gradient comparison will fail and tell you nothing.
 
 The remaining changes below affect the blended path, previously-accepted invalid input, and checkpoint keys.
 
@@ -33,8 +46,9 @@ The remaining changes below affect the blended path, previously-accepted invalid
 
 The scale was `c * mean_b(1 / (mean|y|_b + eps))`, a mean of reciprocals computed over the batch. That had two
 measurable problems. One quiet target inflated the scale for the whole batch, so samples at identical relative
-error saw their gradients change because a *different* sample went quiet: up to 4.8x on rows held otherwise
-constant. And the knob's meaning drifted with batch content, with the batch-to-batch spread in how far
+error saw their gradients change because a *different* sample went quiet. How far depends on the batch: 2.1x
+with one quiet row in four at `l1_weight=0.5`, 4.8x with seven quiet rows in eight, and over 30x at
+`l1_weight=0.9` with a loud held row. It is now exactly 1.000x in every case. And the knob's meaning drifted with batch content, with the batch-to-batch spread in how far
 `l1_weight` moves the loss toward L1 reaching 75 percentage points at `l1_weight=0.5`.
 
 Two new parameters replace it. `ref_level` (default `0.05`) is the typical mean-absolute amplitude of your
@@ -103,15 +117,17 @@ identical, since the transform is linear in the window, and it removes one full-
 per tensor. Measured +14.2% with a standard deviation of 3.2% across interleaved A/B trials on
 `[8, 2, 264600]`, against a noise floor of 0.5%.
 
-Loss values are unchanged bit-for-bit. Gradients are not: see the table in BREAKING CHANGES above, which
-gives the size of the difference as a function of how converged the estimate is. Float64 accuracy slightly
-**improves**, from 6.2e-10 to 5.2e-10 relative error against a fully-float64 reference, because the
-normalization constant is computed in double precision before being cast to the window's dtype.
+Loss values move only at float32 rounding; gradients move more. Both are quantified in the table in BREAKING
+CHANGES above. Float64 accuracy **improves** rather than degrading, because the normalization constant is computed in double
+precision before being cast to the window's dtype. Two independent measurements against differently-built
+float64 references put the improvement between 1.4x and 8x, so the exact ratio is a property of the reference
+as much as of the code and no single figure is quoted. Against 0.1.x the gain is larger still, since that
+version downcast the whole spectrogram result to float32.
 
 Two further optimizations were investigated and did not ship, recorded because the reasons are useful:
 
 - Reducing over dimensions instead of reshaping the strided real and imaginary views avoids roughly 129 MB of
-  contiguous copies per forward. The forward is bit-identical, but the backward graph is not, and the
+  contiguous copies per resolution, so about 389 MB per forward across the three defaults. The forward is bit-identical, but the backward graph is not, and the
   measured time saving was 0.06%. Not worth a change to gradients for no measurable gain.
 - Sharing one STFT between the reconstruction and regularizer paths: **there was nothing to share.** A call
   counter shows six transform calls with the regularizer enabled and six with it disabled, so the transform

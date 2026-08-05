@@ -98,8 +98,10 @@ def test_every_loss_example_calls_backward():
 def _mps_passages():
     changelog_013 = CHANGELOG.split("## 0.1.3")[1].split("## ")[0]
     readme_mps = README.split("**MPS note:**")[1].split("##")[0]
-    source_mps = SOURCE.split("Note: PyTorch's MPS backend")[1][:900]
-    passages = {"CHANGELOG 0.1.3": changelog_013, "README": readme_mps, "l1snr.py": source_mps}
+    # The WHOLE source, not a window around the first mention. A reviewer found three surviving
+    # torch.abs attributions at source offsets 25170, 44197 and 44601 -- including the RuntimeWarning
+    # text a user actually sees -- while this gate inspected only chars 21611-22511 and passed.
+    passages = {"CHANGELOG 0.1.3": changelog_013, "README": readme_mps, "l1snr.py": SOURCE}
     # Drop blockquoted editorial notes. A retraction has to name the wrong cause to be intelligible to
     # someone who read the original, so quoting "torch.abs" inside one is correct rather than a relapse.
     # What must not survive anywhere is the *claim* that torch.abs is the cause.
@@ -116,7 +118,11 @@ def test_mps_cause_names_stft_not_abs(where):
     """
     text = _mps_passages()[where]
     assert "torch.stft" in text, f"{where} does not name torch.stft as the cause"
-    assert "torch.abs" not in text, f"{where} still attributes the bug to torch.abs"
+    # `torch.abs()` with empty parens is how prose refers to the function; `torch.abs(expr)` is a
+    # legitimate call. Scanning the whole source for the bare name matched the implementation's own
+    # arithmetic, which is why this looks for the prose form.
+    assert "torch.abs()" not in text, f"{where} still attributes the bug to torch.abs"
+    assert "bug in torch.abs" not in text, f"{where} still attributes the bug to torch.abs"
 
 
 # --------------------------------------------------------------------------------------
@@ -359,18 +365,75 @@ def test_copyright_identifier_is_consistent():
     assert holder in SETUP_CFG, "setup.cfg does not use the same identifier as LICENSE"
 
 
-def test_changelog_does_not_overclaim_bit_identical_gradients():
-    """The 0.2.0 entry once said gradients were bit-identical to 0.1.x at the default l1_weight.
+def test_changelog_states_compatibility_per_loss_not_globally():
+    """This claim has now been wrong twice, in opposite directions, so the gate is about *shape*.
 
-    They are not: the window fold and the dbrms epsilon cleanup both change them, and the difference reaches
-    5e-02 relative near convergence. An adversarial reviewer found that claim and it would have sent anyone
-    validating the upgrade by diffing gradients to entirely the wrong conclusion. This gate exists so the
-    claim cannot come back.
+    First it said "bit-identical values and gradients" at the default l1_weight, and gradients differ. The
+    correction then said loss values are bit-identical -- and a second reviewer showed that is false too for
+    L1SNRDBLoss with regularization and for both spectrogram classes, which move at float32 rounding. Only
+    L1SNRLoss and L1SNRDBLoss(use_regularization=False) are bit-identical on both.
+
+    So the requirement is that compatibility is stated *per loss class*, never as one global sentence, and
+    that the text steers a validating user to compare loss values rather than gradients.
     """
     breaking = CHANGELOG.split("### BREAKING CHANGES")[1].split("### ")[0]
-    assert "bit-identical values and gradients" not in breaking, (
-        "the CHANGELOG claims bit-identical gradients again; they are not bit-identical")
-    assert "bit-identical loss values" in breaking, (
-        "the CHANGELOG should state precisely what IS bit-identical, namely loss values")
-    assert "Gradients are not bit-identical" in breaking, (
-        "the CHANGELOG must state that gradients differ, since a user may diff them to validate the upgrade")
+    for banned in ["bit-identical values and gradients",
+                   "All four losses return **bit-identical loss values**",
+                   "are unaffected numerically"]:
+        assert banned not in breaking, (
+            f"the CHANGELOG makes a global compatibility claim again ({banned!r}); compatibility differs "
+            "by loss class and must be stated that way")
+    # a per-class table: every class named, and the two that are bit-identical distinguished
+    for cls in ["L1SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]:
+        assert cls in breaking, f"the compatibility table does not mention {cls}"
+    assert "bit-identical" in breaking and "differs" in breaking, (
+        "the table must distinguish the losses that are bit-identical from those that are not")
+    assert "compare loss values, not gradients" in breaking, (
+        "the CHANGELOG must tell a validating user to compare loss values; a strict gradient comparison "
+        "fails at realistic shapes even at 10% error and tells them nothing")
+
+
+def test_readme_dbrms_formula_matches_the_code():
+    """The README documented `20 * log10(sqrt(mean(x**2) + eps) + eps)` after 0.2.0 removed the outer
+    epsilon. A user computing levels by hand from the documented formula would be off by 8.7e-04 dB and
+    would get -79.99913 for silence where the code gives exactly -80."""
+    import ast as _ast
+    src = _ast.get_source_segment(SOURCE, next(
+        n for n in _ast.walk(_ast.parse(SOURCE))
+        if isinstance(n, _ast.FunctionDef) and n.name == "dbrms")) or ""
+    outer_eps_in_code = "log10(rms + eps)" in src.replace(" ", "").replace("torch.", "") or \
+                        "rms+eps" in src.replace(" ", "")
+    outer_eps_in_readme = "+ eps) + eps)" in README
+    assert outer_eps_in_code == outer_eps_in_readme, (
+        f"the README's dbrms formula and the implementation disagree about the outer epsilon "
+        f"(code has it: {outer_eps_in_code}, README shows it: {outer_eps_in_readme})")
+
+
+def test_check_finite_is_on_both_stft_classes_and_documented():
+    """The CHANGELOG said STFTL1SNRDBLoss *and* MultiL1SNRDBLoss gain check_finite. Only the former did,
+    so the documented performance advice was unusable on the class the Quick Start recommends."""
+    import inspect as _inspect
+    for cls in (STFTL1SNRDBLoss, MultiL1SNRDBLoss):
+        assert "check_finite" in _inspect.signature(cls.__init__).parameters, (
+            f"{cls.__name__} does not accept check_finite, but the CHANGELOG says it does")
+    assert "check_finite" in README, (
+        "check_finite is absent from the README, while the Numerical Stability bullet promises the "
+        "behaviour it switches off")
+
+
+def test_no_superseded_figures_survive_in_the_documentation():
+    """Specific numbers that measurement retired. Each was published, then shown wrong.
+
+    They are checked as strings because that is what a reader sees. The list is deliberately concrete:
+    a general "are the numbers right" gate is not possible, but a regression to a *known-wrong* number is.
+    """
+    retired = {
+        "4% of the forward": "the window fold measures 14%, not 4%; 4% came from an isolated micro-benchmark",
+        "6.2e-10 to 5.2e-10": "two careful measurements disagreed by 10x; no absolute figure is published",
+        "9.6e-10": "same",
+        "0.3686": "the retracted spec_weight recommendation",
+        "74.81": "the gradient-ratio figure that did not reproduce even against the old code",
+    }
+    for text, why in retired.items():
+        for where, doc in [("README", README), ("CHANGELOG", CHANGELOG), ("l1snr.py", SOURCE)]:
+            assert text not in doc, f"{where} still contains the retired figure {text!r}: {why}"

@@ -36,7 +36,7 @@ loss.backward()
 - **Multi-Resolution STFT Averaging** - Extending an STFT-based loss to multiple resolutions is common in recent literature.
 - **Spectrogram-Domain Adaptation of Level-Matching Regularizer [[2]](https://arxiv.org/abs/2501.16171)** - Options to extend adaptive level-matching regularization to spectrogram-domain. Experimental and not used by default.
 - **Time vs. Spectrogram Loss Balancing** - Allows fine-tuning the relative contribution of time-domain and spectrogram-domain losses in `MultiL1SNRDBLoss` via the `spec_weight` parameter. Not a novel extension: the authors' own [`bandit`](https://github.com/kwatcharasupat/bandit) exposes equivalent `time_weight`/`freq_weight` controls, and the single-knob `spec_weight` is a convenience over the same idea.
-- **Numerical Stability**: Robust handling of `NaN` and `inf` values during training in `STFTL1SNRDBLoss` (and in `MultiL1SNRDBLoss` through it). The time-domain losses `L1SNRLoss` and `L1SNRDBLoss` do **not** sanitize non-finite input: a `NaN` estimate propagates to a `NaN` loss, which is visible rather than silent.
+- **Numerical Stability**: Robust handling of `NaN` and `inf` values during training in `STFTL1SNRDBLoss` (and in `MultiL1SNRDBLoss` through it), controlled by `check_finite` (default `True`; set it `False` to skip the scan and let non-finite values propagate visibly, which also removes four host-device synchronizations per call on CUDA). The time-domain losses `L1SNRLoss` and `L1SNRDBLoss` do **not** sanitize non-finite input: a `NaN` estimate propagates to a `NaN` loss, which is visible rather than silent.
 - **Short Audio Fallback**: Graceful fallback to time-domain loss when audio is too short for STFT processing.
 
 ## Installation
@@ -193,7 +193,7 @@ levels = dbrms(audio)                   # (4,) tensor of dBRMS values
 print(levels)
 ```
 
-`dbrms(x, eps=1e-8)` computes `20 * log10(sqrt(mean(x**2) + eps) + eps)`. The `eps` default puts the floor for a digitally silent input at about -80 dB, which is deliberately well below the `lmin=-60` threshold the adaptive regularizer uses, so a silent target is correctly recognized as silent.
+`dbrms(x, eps=1e-8)` computes `20 * log10(sqrt(mean(x**2) + eps))`. The `eps` sits inside the square root, on a power quantity, and puts the floor for a digitally silent input at exactly -80 dB -- deliberately well below the `lmin=-60` threshold the adaptive regularizer uses, so a silent target is correctly recognized as silent. (Before v0.2.0 a second epsilon was also added outside the root, on an amplitude; it could never prevent a log of zero and shifted the silence floor to -79.99913 dB.)
 
 ## Motivation
 
@@ -239,9 +239,11 @@ So I recommend starting with no standard L1 mixed in (`l1_weight=0.0`), and then
 
 So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch. Earlier versions of this README stated these as flat percentages matching the parameter value, which was wrong in both directions depending on the data.
 
-**What determines which row applies to you is your target level relative to `ref_level`, not how much your levels vary within a batch.** Level spread turns out to make almost no difference: targets at `mean|y| ~ 0.05` give 9.0% at `l1_weight=0.5` whether the batch is uniform or spans 40 dB. The first row is the one to read if you use the default `ref_level=0.05` on MUSDB-style stems, because that is what the default assumes.
+**What determines which row applies to you is your target level relative to `ref_level`, not how much your levels vary within a batch.** Level spread turns out to make almost no difference: a batch at `mean|y| ~ 0.05` gives 9.0% at `l1_weight=0.5` whether it is uniform or spans 40 dB. What matters is the level of the *loudest* stem in the batch, since that is what sets the gradient profile the metric measures.
 
-Two practical consequences. Starting at `l1_weight=0.1` introduces far less L1 character than the number suggests -- about 1% at the default -- so if the knob seems to do nothing, try substantially larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5` with targets at `ref_level`, the time-domain component moves about 9% toward L1 while the spectrogram component moves further, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
+For MUSDB-style stems at the default `ref_level=0.05`, expect somewhere between the first two rows. The measured median stem level is 0.053, but the 99th percentile is 0.116, a little over 2x `ref_level`, and a batch containing one such stem lands near 20% rather than 9%. Read the first row as a floor and the second as a typical case.
+
+Two practical consequences. Starting at `l1_weight=0.1` introduces far less L1 character than the number suggests -- roughly 1-3% for MUSDB-style data -- so if the knob seems to do nothing, try substantially larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5` with targets at `ref_level`, the time-domain component moves about 9% toward L1 while the spectrogram component moves further, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
 
 #### `ref_level`: what the L1 term is scaled against
 
@@ -261,7 +263,7 @@ The implementation is optimized for efficiency: if `l1_weight` is `0.0` or `1.0`
 
 **Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation scales the L1 component by the reference signal magnitude rather than the error magnitude. The purpose is to keep the two components' gradient *profiles* distinct: L1SNR produces inverse-error-scaled gradients while L1 produces uniform ones, and scaling by the error would collapse the second into the first (this was the v0.1.2 bugfix).
 
-The scaling brings the two components to a comparable magnitude near 0 dB SNR, but it does not equalize them across the range, and it is not intended to. The L1 term's gradient magnitude is independent of the error, while L1SNR's grows as the error shrinks, so the ratio between them necessarily widens as the model improves. Measured on a single 8192-sample target at `mean|y| = 0.05` with `ref_level=0.05`, the D1-to-L1 gradient-norm ratio is about 1.2 at 0 dB SNR, 10 at 20 dB, 36 at 40 dB and 49 at 60 dB.
+The scaling brings the two components to a comparable magnitude near 0 dB SNR, but it does not equalize them across the range, and it is not intended to. The L1 term's gradient magnitude is independent of the error, while L1SNR's grows as the error shrinks, so the ratio between them necessarily widens as the model improves. Measured on a single 8192-sample target with `ref_level=0.05`, the D1-to-L1 gradient-norm ratio is about 1.0 at 0 dB SNR, 8.5 at 20 dB, 34 at 40 dB and 49 at 60 dB when the target's `mean|y|` is exactly 0.05. Those figures shift by 20-25% with the target level -- at `mean|y| = 0.04` they are 1.25, 10.2, 36.5 and 49.0 -- so read them as the shape of the trend, not as constants.
 
 Those particular numbers depend on the target level and on how `ref_level` is set, so treat them as an illustration of the trend rather than constants. The point to take away is that `l1_weight` is an interpolation coefficient to tune, not a guaranteed balance between the two terms.
 

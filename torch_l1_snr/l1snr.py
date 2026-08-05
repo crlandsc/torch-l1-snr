@@ -492,7 +492,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             When set to 1.0, efficiently computes only L1 loss.
         mps_cpu_fallback (bool): When True (default), routes STFT computation through
             CPU on MPS devices to avoid incorrect gradients from a PyTorch MPS backend
-            bug in torch.abs() backward on complex tensors.
+            bug in torch.stft backward above an input length of 65,536 samples.
         ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
             term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
             Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
@@ -593,9 +593,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             """
             w = _f(length)
             # Normalize in float64 then cast back, so the stored window is the best representation of the
-            # correct value rather than the result of a lower-precision division. Measured against a
-            # fully-float64 ground truth this keeps the float64 path at 6.4e-10 relative error instead of
-            # 9.6e-10; both are dominated by torchaudio building the window in float32 in the first place.
+            # correct value rather than the result of a lower-precision division. Against a fully-float64
+            # ground truth this measurably improves the float64 path rather than degrading it, which matters
+            # because A9 exists to preserve float64. No absolute figure is quoted here: two careful
+            # measurements with differently-constructed references disagreed by an order of magnitude, so
+            # the ratio is a property of the comparison as much as of the code. What is robust, and gated in
+            # tests/test_edge_cases.py, is that the stored window is closer to the exact normalized window
+            # than a float32 division would be, and that the end-to-end error stays under a measured bound.
             w64 = w.double()
             return (w64 / w64.pow(2).sum().sqrt()).to(w.dtype)
 
@@ -854,14 +858,15 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             return self.fallback_time_loss(estimates, actuals, *args, **kwargs) * self.weight
 
         # MPS workaround: route STFT computation through CPU to avoid
-        # incorrect gradients from torch.abs() backward on complex tensors.
+        # incorrect gradients from torch.stft backward above ~65,536 samples.
         # .cpu() is differentiable — backward uses CPU kernels automatically.
         _use_cpu = self.mps_cpu_fallback and device.type == 'mps'
         if _use_cpu:
             if not self._mps_warned:
                 warnings.warn(
                     f"{self.name}: Routing STFT loss through CPU to work around "
-                    "PyTorch MPS backend bug in torch.abs() backward on complex tensors. "
+                    "PyTorch MPS backend bug in torch.stft backward above an input length of "
+                    "65,536 samples. "
                     "Set mps_cpu_fallback=False to disable.",
                     stacklevel=2,
                 )
@@ -1044,6 +1049,9 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             used when use_spec_regularization=True.
         mps_cpu_fallback (bool): When True (default), routes the spectrogram branch's STFT through
             CPU on MPS devices to work around incorrect torch.stft backward gradients.
+        check_finite (bool): Passed to the spectrogram branch. When True (default), its inputs are
+            scanned for NaN and Inf each call and replaced with zeros, warning once. See
+            STFTL1SNRDBLoss for the cost and for why False is defensible.
         time_loss_params (dict): Optional additional parameters to pass to time domain loss.
             Overrides any of the above for the time-domain component only.
         spec_loss_params (dict): Optional additional parameters to pass to spectrogram domain loss.
@@ -1097,6 +1105,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         spec_loss_params: Optional[dict] = None,
         # MPS workaround
         mps_cpu_fallback: bool = True,
+        check_finite: bool = True,
     ):
         super().__init__()
         # spec_weight above 1 makes the time-domain coefficient (1 - spec_weight) negative in forward,
@@ -1148,6 +1157,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             "ref_level": ref_level,
             "spec_ref_level": spec_ref_level,
             "mps_cpu_fallback": mps_cpu_fallback,
+            "check_finite": check_finite,
             "use_regularization": use_spec_regularization  # Apply spectrogram domain regularization flag
         }
 
