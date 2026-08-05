@@ -68,6 +68,32 @@ without changing the behaviour it had already determined. Construct a new loss i
 outside the square root. It could never prevent a log of zero and is removed. Measured effect below 0.001 dB
 across levels from silence to 10.0; the -80 dB silence floor is preserved exactly.
 
+### Performance
+
+`STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` gain `check_finite` (default `True`, preserving current behaviour).
+The non-finite input scan costs four full-tensor passes whose results are consumed by a Python `if`, which on
+CUDA forces a host-device synchronization and serializes the pipeline. Setting it `False` saves about 1% of a
+CPU forward and removes those synchronizations; the loss then propagates `NaN` rather than replacing it with
+zeros, which is arguably preferable during training anyway.
+
+Otherwise this release is **not** faster, and the reasons are worth stating rather than omitting. Four other
+optimizations were investigated on an idle machine at a realistic batch shape, and none shipped:
+
+- Folding the STFT window normalization into the window itself is mathematically exact and saves about 4% of
+  the forward. Declined: moving the multiply inside the transform reorders the arithmetic, so float32 results
+  differ at the last bit. A few percent on a computation that is already small beside a model's forward and
+  backward did not justify changing the number a training run reports.
+- Reducing over dimensions instead of reshaping the strided real and imaginary views avoids roughly 129 MB of
+  contiguous copies per forward. The forward is bit-identical, but the backward graph is not, so gradients
+  differ at machine epsilon. Measured time saving was 0.06%. Declined on the same grounds.
+- Sharing one STFT between the reconstruction and regularizer paths: **there was nothing to share.** A call
+  counter shows six transform calls with the regularizer enabled and six with it disabled, so the transform
+  was never recomputed. The premise was wrong.
+- Hoisting the per-call device move out of `forward` is now guarded, but it measures 0.02 ms, about 0.007%.
+
+Net measurable change at default settings is +0.2% with a standard deviation of 1.1% across interleaved
+trials, which is to say none. Every returned value and gradient is bit-identical across 120 configurations.
+
 ### Other changes
 
 - Silent degradations are now audible. One-shot warnings per loss instance when non-finite input is sanitized

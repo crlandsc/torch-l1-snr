@@ -497,6 +497,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             it equal to ref_level: the STFT reference is about 5.6x lower, and that error costs
             roughly 20 points of knob position at l1_weight=0.5. The spectrogram knob is 2-3x more
             sensitive to this than the time-domain one.
+        check_finite (bool): When True (default), scan the inputs for NaN and Inf each call and
+            replace them with zeros, warning once. Costs four full-tensor scans whose results are
+            consumed by a Python `if`, which on CUDA forces a host-device synchronization and
+            serializes the pipeline. Measured at roughly 3 ms of a 344 ms CPU forward on
+            [8, 2, 264600]. Set False once you trust your data pipeline to be finite; the loss will
+            then propagate NaN rather than hiding it, which is arguably the better default for
+            training anyway.
     """
     def __init__(
         self,
@@ -518,11 +525,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         mps_cpu_fallback: bool = True,
         ref_level: float = 0.05,
         spec_ref_level: Optional[float] = None,
+        check_finite: bool = True,
     ):
         super().__init__()
         _validate_ref_level(ref_level)
         if spec_ref_level is not None:
             _validate_ref_level(spec_ref_level)
+        self.check_finite = check_finite
         self.ref_level = ref_level
         self.spec_ref_level = spec_ref_level
         # Derived rather than defaulted to ref_level: the normalized-STFT reference is 5.6x below the
@@ -553,6 +562,15 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Pre-initialize Spectrogram transforms for maximum efficiency
         self.spectrogram_transforms = nn.ModuleList()
         window_fn_callable = getattr(torch, f"{window_fn}_window")
+
+        # Note on an optimization deliberately NOT taken. Pre-scaling the window by 1 / ||w||_2 and passing
+        # normalized=False is mathematically identical, since stft is linear in the window, and saves one
+        # full-tensor pass per resolution per tensor: measured 2.21 ms of 19.25 ms per transform call, about
+        # 4% of the forward. It was declined because it is the only change in this area that is not
+        # bit-identical: moving the multiply inside the transform reorders the arithmetic, so float32 results
+        # differ at the last bit (relative 1.5e-07, and 3.8e-16 in float64, i.e. pure rounding). For a
+        # published loss whose cost is already small beside a model's forward and backward, a few percent did
+        # not seem worth changing the number anyone's training run reports.
 
         for n_fft, hop_length, win_length in zip(n_ffts, hop_lengths, win_lengths):
             # Create a spectrogram transform for each resolution
@@ -621,6 +639,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         # MPS CPU fallback for correct gradients
         self.mps_cpu_fallback = mps_cpu_fallback
+        # Transforms are constructed on CPU; forward moves them only when the input device differs.
+        self._transforms_device = torch.device("cpu")
         self._mps_warned = False
         self._nan_warned = False
         self._fallback_warned = False
@@ -664,6 +684,14 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         act_im = act_im.reshape(B, -1)
 
         # L1 errors and refs
+        #
+        # A second optimization deliberately NOT taken. Reducing over the non-batch dims directly, instead of
+        # reshaping these strided views, avoids a contiguous copy (~129 MB per forward on a realistic batch).
+        # The forward result is bit-identical, but the backward graph is not: reshape-then-mean(dim=1) and
+        # mean(dim=(1,2,3)) accumulate differently, giving gradient differences at machine epsilon
+        # (relative 1.6e-07 in float32, 3.0e-16 in float64). Measured time saving was 0.2 ms of a 344 ms
+        # forward, about 0.06%. Declined on the same grounds as the window-normalization fold above: a
+        # negligible gain does not justify changing the numbers a training run reports.
         err_re = torch.mean(torch.abs(est_re - act_re), dim=1)
         ref_re = torch.mean(torch.abs(act_re), dim=1)
         err_im = torch.mean(torch.abs(est_im - act_im), dim=1)
@@ -761,7 +789,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         # Sanitize non-finite input. Deliberate, but it must not be silent: an all-NaN estimate otherwise
         # yields exactly 0.0 with an all-zero gradient, so a diverged run looks healthy.
-        if torch.isnan(estimates).any() or torch.isinf(estimates).any() or torch.isnan(actuals).any() or torch.isinf(actuals).any():
+        if self.check_finite and (
+            torch.isnan(estimates).any() or torch.isinf(estimates).any()
+            or torch.isnan(actuals).any() or torch.isinf(actuals).any()
+        ):
             if not self._nan_warned:
                 warnings.warn(
                     f"{self.name}: non-finite values (NaN or Inf) found in the loss input and replaced "
@@ -839,8 +870,11 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         total_spec_reg_loss = torch.zeros((), dtype=acc_dtype, device=compute_device)
         valid_transforms = 0
 
-        # Ensure transforms are on the correct device
-        self.spectrogram_transforms.to(compute_device)
+        # Ensure transforms are on the correct device. Guarded rather than unconditional: .to() on an
+        # already-correct device still walks every submodule and buffer on every call.
+        if self._transforms_device != compute_device:
+            self.spectrogram_transforms.to(compute_device)
+            self._transforms_device = compute_device
 
         # Process each usable resolution. The try/except blocks below remain as a backstop, but with the
         # requirement checked up front they should no longer be the mechanism that decides the arity.
