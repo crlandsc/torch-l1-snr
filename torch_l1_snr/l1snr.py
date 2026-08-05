@@ -36,6 +36,18 @@ from typing import Optional, List
 _WINDOW_FNS = ("hann", "hamming", "blackman", "bartlett", "kaiser")
 
 
+# Ratio of the normalized-STFT reference magnitude to the time-domain one, measured as the median over 496
+# real MUSDB stem-chunks (mean|Re S| = 0.00950 against mean|y| = 0.05348). Stable across the three default
+# resolutions to within 1.34x and between the real and imaginary parts to within 1%, so one constant serves
+# all six slots. See _audit_local/P0_SPEC_REF_LEVEL.md.
+_STFT_REF_RATIO = 0.19
+
+
+def _validate_ref_level(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0.0:
+        raise ValueError(f"ref_level must be a positive number, got {value!r}")
+
+
 def _validate_matching_shapes(estimates, actuals):
     """Reject differing shapes before any reshape flattens the difference away.
 
@@ -132,6 +144,16 @@ class L1SNRLoss(torch.nn.Module):
         weight (float): Global weight multiplier for the loss.
         eps (float): Small epsilon for numerical stability in D1 (default 1e-3 per the papers).
         l1_weight (float): Weight for the L1 term mixed into L1SNR.
+        ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
+            term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
+            Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
+            Replaces a per-batch statistic. Previously the scale was
+            c * mean_b(1 / (mean|y|_b + eps)), a mean of reciprocals, so one quiet target inflated
+            the gradient for every other sample in the batch (measured up to 5.73x) and l1_weight
+            meant different things from run to run (0.5 delivering 15% to 91% of the way toward L1
+            depending on batch content). To set it for your data, measure the mean absolute value
+            of your targets over a few batches. Being off by 2x moves the knob about 5 points;
+            being off by 10x matters.
     """
     def __init__(
         self,
@@ -139,9 +161,12 @@ class L1SNRLoss(torch.nn.Module):
         weight: float = 1.0,
         eps: float = 1e-3,
         l1_weight: float = 0.0,
+        ref_level: float = 0.05,
     ):
         super().__init__()
         _validate_unit_range("l1_weight", l1_weight)
+        _validate_ref_level(ref_level)
+        self.ref_level = ref_level
         self.name = name
         self.weight = weight
         self.eps = eps
@@ -190,10 +215,11 @@ class L1SNRLoss(torch.nn.Module):
         l1snr_loss = torch.mean(d1)
 
         c = 10.0 / math.log(10.0)
-        # Scale by reference signal magnitude (not error) to preserve gradient distinction
-        # L1SNR has inverse-error gradients; L1 should have uniform gradients
-        inv_ref_mean = torch.mean(1.0 / (l1_true.detach() + self.eps))
-        scale_time = c * inv_ref_mean
+        # Scale by a fixed reference level, not by a batch statistic. Scaling by the *reference* rather than
+        # the error is what keeps the two gradient profiles distinct (the v0.1.2 fix); using a constant rather
+        # than mean_b(1 / (ref_b + eps)) is what stops one quiet target in the batch from inflating every
+        # other sample's gradient, and what makes l1_weight mean the same thing from run to run.
+        scale_time = c / (self.ref_level + self.eps)
         l1_term = torch.mean(l1_error) * scale_time
 
         loss = (1.0 - w) * l1snr_loss + w * l1_term
@@ -248,6 +274,16 @@ class L1SNRDBLoss(torch.nn.Module):
             give its short-audio fallback the same regularizer weight as its own spectral path
             (spec_reg_coef), keeping that weight continuous across the fallback boundary instead of
             jumping by 10x.
+        ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
+            term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
+            Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
+            Replaces a per-batch statistic. Previously the scale was
+            c * mean_b(1 / (mean|y|_b + eps)), a mean of reciprocals, so one quiet target inflated
+            the gradient for every other sample in the batch (measured up to 5.73x) and l1_weight
+            meant different things from run to run (0.5 delivering 15% to 91% of the way toward L1
+            depending on batch content). To set it for your data, measure the mean absolute value
+            of your targets over a few batches. Being off by 2x moves the knob about 5 points;
+            being off by 10x matters.
     """
     def __init__(
         self,
@@ -261,8 +297,11 @@ class L1SNRDBLoss(torch.nn.Module):
         use_regularization: bool = True,
         l1_weight: float = 0.0,
         reg_coef: float = 1.0,
+        ref_level: float = 0.05,
     ):
         super().__init__()
+        _validate_ref_level(ref_level)
+        self.ref_level = ref_level
         self.name = name
         self.weight = weight
         self.reg_coef = reg_coef
@@ -288,6 +327,7 @@ class L1SNRDBLoss(torch.nn.Module):
                 weight=1.0,  # We'll apply the weight at the end
                 eps=l1snr_eps,
                 l1_weight=l1_weight,
+                ref_level=ref_level,
             )
             self.l1_loss = None
 
@@ -441,6 +481,22 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         mps_cpu_fallback (bool): When True (default), routes STFT computation through
             CPU on MPS devices to avoid incorrect gradients from a PyTorch MPS backend
             bug in torch.abs() backward on complex tensors.
+        ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
+            term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
+            Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
+            Replaces a per-batch statistic. Previously the scale was
+            c * mean_b(1 / (mean|y|_b + eps)), a mean of reciprocals, so one quiet target inflated
+            the gradient for every other sample in the batch (measured up to 5.73x) and l1_weight
+            meant different things from run to run (0.5 delivering 15% to 91% of the way toward L1
+            depending on batch content). To set it for your data, measure the mean absolute value
+            of your targets over a few batches. Being off by 2x moves the knob about 5 points;
+            being off by 10x matters.
+        spec_ref_level (float): Same idea for the spectrogram domain. Leave as None to derive it as
+            0.19 * ref_level, which is the measured median ratio of normalized-STFT reference
+            magnitude to time-domain magnitude over 496 real MUSDB stem-chunks. Do not simply set
+            it equal to ref_level: the STFT reference is about 5.6x lower, and that error costs
+            roughly 20 points of knob position at l1_weight=0.5. The spectrogram knob is 2-3x more
+            sensitive to this than the time-domain one.
     """
     def __init__(
         self,
@@ -460,8 +516,21 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         spec_reg_coef: float = 0.1,
         l1_weight: float = 0.0,
         mps_cpu_fallback: bool = True,
+        ref_level: float = 0.05,
+        spec_ref_level: Optional[float] = None,
     ):
         super().__init__()
+        _validate_ref_level(ref_level)
+        if spec_ref_level is not None:
+            _validate_ref_level(spec_ref_level)
+        self.ref_level = ref_level
+        self.spec_ref_level = spec_ref_level
+        # Derived rather than defaulted to ref_level: the normalized-STFT reference is 5.6x below the
+        # time-domain one, so reusing ref_level here would be 5.3x too large. Deriving also means a user who
+        # sets ref_level for quieter audio gets the spectrogram side right for free.
+        self._resolved_spec_ref_level = (
+            spec_ref_level if spec_ref_level is not None else _STFT_REF_RATIO * ref_level
+        )
         self.name = name
         self.weight = weight
         self.min_audio_length = min_audio_length
@@ -547,6 +616,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             use_regularization=use_regularization,
             reg_coef=spec_reg_coef,
             l1_weight=self.l1_weight,
+            ref_level=ref_level,
         )
 
         # MPS CPU fallback for correct gradients
@@ -615,11 +685,9 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         w = float(self.l1_weight)
         if 0.0 < w < 1.0:
             c = 10.0 / math.log(10.0)
-            # Scale by reference signal magnitude (not error) to preserve gradient distinction
-            # L1SNR has inverse-error gradients; L1 should have uniform gradients
-            inv_ref_mean_comp = torch.mean(0.5 * (1.0 / (ref_re.detach() + self.l1snr_eps) +
-                                                  1.0 / (ref_im.detach() + self.l1snr_eps)))
-            scale_spec = 2.0 * c * inv_ref_mean_comp
+            # A fixed spectrogram reference level, for the same reasons as the time domain. The factor 2
+            # accounts for d1_sum carrying both a real and an imaginary term.
+            scale_spec = 2.0 * c / (self._resolved_spec_ref_level + self.l1snr_eps)
             l1_term = 0.5 * (torch.mean(err_re) + torch.mean(err_im)) * scale_spec
 
             loss = (1.0 - w) * d1_sum + w * l1_term
@@ -936,6 +1004,22 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             Overrides any of the above for the time-domain component only.
         spec_loss_params (dict): Optional additional parameters to pass to spectrogram domain loss.
             Overrides any of the above for the spectrogram component only.
+        ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
+            term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
+            Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
+            Replaces a per-batch statistic. Previously the scale was
+            c * mean_b(1 / (mean|y|_b + eps)), a mean of reciprocals, so one quiet target inflated
+            the gradient for every other sample in the batch (measured up to 5.73x) and l1_weight
+            meant different things from run to run (0.5 delivering 15% to 91% of the way toward L1
+            depending on batch content). To set it for your data, measure the mean absolute value
+            of your targets over a few batches. Being off by 2x moves the knob about 5 points;
+            being off by 10x matters.
+        spec_ref_level (float): Same idea for the spectrogram domain. Leave as None to derive it as
+            0.19 * ref_level, which is the measured median ratio of normalized-STFT reference
+            magnitude to time-domain magnitude over 496 real MUSDB stem-chunks. Do not simply set
+            it equal to ref_level: the STFT reference is about 5.6x lower, and that error costs
+            roughly 20 points of knob position at l1_weight=0.5. The spectrogram knob is 2-3x more
+            sensitive to this than the time-domain one.
     """
     def __init__(
         self,
@@ -962,6 +1046,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         window_fn: str = 'hann',
         min_audio_length: int = 512,
         spec_reg_coef: float = 0.1,
+        ref_level: float = 0.05,
+        spec_ref_level: Optional[float] = None,
         # Allow for separate parameter overrides (e.g. different delta_lambda for time and spec)
         time_loss_params: Optional[dict] = None,
         spec_loss_params: Optional[dict] = None,
@@ -972,6 +1058,11 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         # spec_weight above 1 makes the time-domain coefficient (1 - spec_weight) negative in forward,
         # instructing the optimizer to MAXIMISE time-domain error. Never leave this unvalidated.
         _validate_unit_range("spec_weight", spec_weight)
+        _validate_ref_level(ref_level)
+        if spec_ref_level is not None:
+            _validate_ref_level(spec_ref_level)
+        self.ref_level = ref_level
+        self.spec_ref_level = spec_ref_level
         self.name = name
         self.weight = weight
         self.spec_weight = spec_weight
@@ -991,6 +1082,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             "dbrms_eps": dbrms_eps,
             "lmin": lmin,
             "l1_weight": l1_weight,
+            "ref_level": ref_level,
             "use_regularization": use_time_regularization  # Apply time domain regularization flag
         }
 
@@ -1009,6 +1101,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             "min_audio_length": min_audio_length,
             "spec_reg_coef": spec_reg_coef,
             "l1_weight": l1_weight,
+            "ref_level": ref_level,
+            "spec_ref_level": spec_ref_level,
             "mps_cpu_fallback": mps_cpu_fallback,
             "use_regularization": use_spec_regularization  # Apply spectrogram domain regularization flag
         }

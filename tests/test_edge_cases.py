@@ -737,3 +737,122 @@ def test_dbrms_silence_floor_is_exactly_the_power_epsilon():
     floor = dbrms(torch.zeros(2, 4096)).max().item()
     assert abs(floor - (-80.0)) < 1e-5, f"silence floor is {floor}, expected exactly -80.0"
     assert floor < -60.0, "the floor must sit below lmin so silence is recognized as silent"
+
+
+# ---------------------------------------------------------------------------------------------
+# A14 -- the one numerics change: a module constant in place of a batch statistic
+# ---------------------------------------------------------------------------------------------
+#
+# M3. The L1/L1SNR blend scaled the L1 term by c * mean_b(1 / (ref_b + eps)) -- a mean of *reciprocals*, so
+# one quiet target inflated the scale for the whole batch. Measured: rows at identical relative error saw
+# their gradients move by 5.73x because a different row went quiet.
+#
+# M22. It also made the knob mean different things run to run: l1_weight=0.5 delivered anywhere from 15% to
+# 91% of the way toward L1 behaviour depending on batch content.
+#
+# Both are fixed by the same edit. The two properties below are what distinguish the correct fix from the
+# per-row form an adversarial panel originally recommended, which decoupled correctly but diverged *away*
+# from L1 (profile 9.5714 against pure D1's 7.0000) and gave a non-monotone knob with a cliff at w=1.
+
+def _row_profile(loss_fn, levels, relerr=0.1, T=4096, seed=0):
+    """Ratio of per-row gradient magnitude between the quietest and loudest row.
+
+    This is the operationalisation of "how much L1 behaviour": both terms push in the same direction, so the
+    only thing l1_weight controls is how strongly each sample's update is scaled by its own error magnitude.
+    """
+    g = torch.Generator().manual_seed(seed)
+    act = torch.stack([torch.randn(T, generator=g) * lv for lv in levels])
+    est = act.clone()
+    for i, lv in enumerate(levels):
+        est[i] += relerr * lv * torch.randn(T, generator=g)
+    est = est.requires_grad_(True)
+    loss_fn(est, act).backward()
+    per_row = [est.grad[i].abs().mean().item() for i in range(len(levels))]
+    return max(per_row) / min(per_row)
+
+
+def test_one_quiet_target_no_longer_moves_the_other_rows_gradients():
+    """M3, the defect itself. Rows 0-2 are held identical; only row 3's level changes."""
+    ratios = []
+    for row3 in [0.2, 0.02, 0.002, 0.0]:
+        g = torch.Generator().manual_seed(0)
+        levels = [0.2, 0.2, 0.2, row3]
+        act = torch.stack([torch.randn(4096, generator=g) * lv for lv in levels])
+        est = act.clone()
+        for i, lv in enumerate(levels):
+            est[i] += 0.1 * lv * torch.randn(4096, generator=g)
+        est = est.requires_grad_(True)
+        L1SNRLoss(name="t", l1_weight=0.5)(est, act).backward()
+        ratios.append(est.grad[:3].abs().mean().item())
+    baseline = ratios[0]
+    for r, row3 in zip(ratios, [0.2, 0.02, 0.002, 0.0]):
+        rel = r / baseline
+        assert abs(rel - 1.0) < 1e-3, (
+            f"row 3 at level {row3} moved rows 0-2 gradients by {rel:.3f}x; before the fix this reached "
+            f"5.730x at silence")
+
+
+@pytest.mark.parametrize("l1_weight", [0.0, 0.25, 0.5, 0.75, 1.0])
+def test_the_knob_stays_monotone_toward_l1(l1_weight):
+    """The property the rejected per-row form failed: it ended at 9.5714, *more* quiet-biased than pure D1,
+    then collapsed discontinuously to 1.0 at the endpoint because of the w >= 1.0 shortcut."""
+    levels = [0.2, 0.2, 0.2, 0.02]
+    profiles = {w: _row_profile(L1SNRLoss(name="t", l1_weight=w), levels)
+                for w in [0.0, 0.25, 0.5, 0.75, 1.0]}
+    ordered = [profiles[w] for w in [0.0, 0.25, 0.5, 0.75, 1.0]]
+    assert ordered == sorted(ordered, reverse=True), (
+        f"profile is not monotone decreasing toward L1: {ordered}")
+    assert abs(profiles[1.0] - 1.0) < 0.01, f"w=1.0 should reach pure L1 (1.0), got {profiles[1.0]:.4f}"
+    assert profiles[0.0] > 5.0, f"w=0.0 should retain D1's quiet bias, got {profiles[0.0]:.4f}"
+
+
+def test_ref_level_is_a_calibration_handle():
+    """K only sets how fast the knob moves; it cannot reintroduce coupling or break monotonicity."""
+    levels = [0.5, 0.1, 0.02, 0.005]
+    profiles = [_row_profile(L1SNRLoss(name="t", l1_weight=0.5, ref_level=rl), levels)
+                for rl in [1.0, 0.05, 0.005]]
+    assert profiles[0] > profiles[1] > profiles[2], (
+        f"a smaller ref_level should move the knob further toward L1: {profiles}")
+
+
+def test_spec_ref_level_defaults_to_the_measured_ratio():
+    """P0-1: the STFT reference is 5.6x below the time-domain one, measured on 496 real MUSDB stem-chunks.
+
+    Defaulting spec_ref_level to ref_level would be 5.3x too large, costing 19.7 points of knob position at
+    l1_weight=0.5. It is derived instead, so a user who sets ref_level for their data gets both domains right.
+    """
+    loss_fn = STFTL1SNRDBLoss(name="t", l1_weight=0.5, ref_level=0.05)
+    assert abs(loss_fn._resolved_spec_ref_level - 0.0095) < 1e-6, (
+        f"expected 0.19 * 0.05 = 0.0095, got {loss_fn._resolved_spec_ref_level}")
+    # and it tracks ref_level rather than sitting at an absolute value
+    quiet = STFTL1SNRDBLoss(name="t", l1_weight=0.5, ref_level=0.005)
+    assert abs(quiet._resolved_spec_ref_level - 0.00095) < 1e-7
+    # explicit override wins
+    override = STFTL1SNRDBLoss(name="t", l1_weight=0.5, ref_level=0.05, spec_ref_level=0.02)
+    assert override._resolved_spec_ref_level == 0.02
+
+
+def test_pure_snr_path_is_untouched():
+    """A14 must not perturb l1_weight=0.0, which is the default and what the training configs use."""
+    est, act = audio(3, 4096), audio(3, 4096, seed=1)
+    for cls in ALL_CLASSES:
+        got = cls(name="t", l1_weight=0.0)(est, act)
+        assert not torch.isnan(got)
+    assert torch.allclose(L1SNRLoss(name="t", l1_weight=0.0)(est, act),
+                          reference.l1snr(est, act), atol=1e-7)
+
+
+def test_blend_matches_the_constant_k_reference():
+    """The blended path must equal an independently computed constant-K blend, not the old batch statistic."""
+    est, act = audio(4, 4096), audio(4, 4096, seed=1)
+    for w in [0.25, 0.5, 0.75]:
+        got = L1SNRLoss(name="t", l1_weight=w, ref_level=0.05)(est, act)
+        expected = reference.l1snr_blended(est, act, l1_weight=w, ref_level=0.05)
+        assert torch.allclose(got, expected, atol=1e-6), f"w={w}: {got.item()} vs {expected.item()}"
+
+
+def test_ref_level_must_be_positive():
+    with pytest.raises(ValueError, match="ref_level"):
+        L1SNRLoss(name="t", ref_level=0.0)
+    with pytest.raises(ValueError, match="ref_level"):
+        L1SNRLoss(name="t", ref_level=-0.1)

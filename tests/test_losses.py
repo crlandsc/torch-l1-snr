@@ -157,9 +157,12 @@ def test_stem_multi_loss(dummy_stems):
     )
     loss = loss_fn_stem(est_stem, act_stem)
     assert loss.ndim == 0
-    assert torch.allclose(loss, 0.5 * reference.l1snr_db(est_stem, act_stem, l1_weight=0.1)
-                                + 0.5 * reference.multi_res_spec_d1(est_stem, act_stem, l1_weight=0.1),
-                          atol=1e-5)
+    assert torch.allclose(
+        loss,
+        0.5 * reference.l1snr_db(est_stem, act_stem, l1_weight=0.1, ref_level=REF_LEVEL)
+        + 0.5 * reference.multi_res_spec_d1(est_stem, act_stem, l1_weight=0.1,
+                                            spec_ref_level=SPEC_REF_LEVEL),
+        atol=1e-5)
 
     # Test with all stems jointly - flatten all stems together
     # Reshape to [batch, -1] to process all stems at once
@@ -171,17 +174,23 @@ def test_stem_multi_loss(dummy_stems):
         l1_weight=0.1
     )
     loss_all = loss_fn_all(est_all, act_all)
-    assert torch.allclose(loss_all, 0.5 * reference.l1snr_db(est_all, act_all, l1_weight=0.1)
-                                    + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=0.1),
-                          atol=1e-5)
+    assert torch.allclose(
+        loss_all,
+        0.5 * reference.l1snr_db(est_all, act_all, l1_weight=0.1, ref_level=REF_LEVEL)
+        + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=0.1,
+                                            spec_ref_level=SPEC_REF_LEVEL),
+        atol=1e-5)
 
     # Pure L1 mode on all stems. The reference now covers the spectrogram L1 endpoint, so this is a value
     # assertion rather than the isnan check it used to be.
     loss_fn_l1 = MultiL1SNRDBLoss(name="l1_only", l1_weight=1.0)
     l1_loss = loss_fn_l1(est_all, act_all)
-    assert torch.allclose(l1_loss, 0.5 * reference.l1snr_db(est_all, act_all, l1_weight=1.0)
-                                   + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=1.0),
-                          atol=1e-5)
+    assert torch.allclose(
+        l1_loss,
+        0.5 * reference.l1snr_db(est_all, act_all, l1_weight=1.0, ref_level=REF_LEVEL)
+        + 0.5 * reference.multi_res_spec_d1(est_all, act_all, l1_weight=1.0,
+                                            spec_ref_level=SPEC_REF_LEVEL),
+        atol=1e-5)
 
 @pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
 def test_loss_variants(dummy_audio, l1_weight):
@@ -190,13 +199,13 @@ def test_loss_variants(dummy_audio, l1_weight):
     
     time_loss_fn = L1SNRDBLoss(name=f"test_time_{l1_weight}", l1_weight=l1_weight)
     time_loss = time_loss_fn(estimates, actuals)
-    assert torch.allclose(time_loss, reference.l1snr_db(estimates, actuals, l1_weight=l1_weight),
-                          atol=1e-6)
+    assert torch.allclose(time_loss, reference.l1snr_db(estimates, actuals, l1_weight=l1_weight,
+                                                       ref_level=REF_LEVEL), atol=1e-6)
 
     spec_loss_fn = STFTL1SNRDBLoss(name=f"test_spec_{l1_weight}", l1_weight=l1_weight)
     spec_loss = spec_loss_fn(estimates, actuals)
-    assert torch.allclose(spec_loss, reference.multi_res_spec_d1(estimates, actuals,
-                                                                l1_weight=l1_weight), atol=1e-5)
+    assert torch.allclose(spec_loss, reference.multi_res_spec_d1(
+        estimates, actuals, l1_weight=l1_weight, spec_ref_level=SPEC_REF_LEVEL), atol=1e-5)
 
 # --- Wrapper-Paradigm Tests ---
 
@@ -212,17 +221,25 @@ def test_loss_variants(dummy_audio, l1_weight):
 # They now compare against tests/reference.py, which is derived from the definitions, imports nothing from
 # torch_l1_snr, and is itself validated against hand-computed values (see test_reference_matches_hand_arithmetic).
 
+# A14 replaced the batch statistic with module constants, so the reference is given the same constants the
+# library derives: ref_level for the time domain, 0.19 * ref_level for the spectrogram domain (the measured
+# STFT-to-time reference ratio, P0_SPEC_REF_LEVEL.md).
+REF_LEVEL = 0.05
+SPEC_REF_LEVEL = 0.19 * REF_LEVEL
+
 REF_BY_CLASS = {
     "L1SNRLoss": lambda est, act, **kw: reference.l1snr_blended(
-        est, act, l1_weight=kw["l1_weight"]),
+        est, act, l1_weight=kw["l1_weight"], ref_level=REF_LEVEL),
     "L1SNRDBLoss": lambda est, act, **kw: reference.l1snr_db(
-        est, act, l1_weight=kw["l1_weight"], use_regularization=kw["use_reg"]),
+        est, act, l1_weight=kw["l1_weight"], use_regularization=kw["use_reg"],
+        ref_level=REF_LEVEL),
     "STFTL1SNRDBLoss": lambda est, act, **kw: reference.multi_res_spec_d1(
-        est, act, l1_weight=kw["l1_weight"]),
+        est, act, l1_weight=kw["l1_weight"], spec_ref_level=SPEC_REF_LEVEL),
     "MultiL1SNRDBLoss": lambda est, act, **kw: (
         0.5 * reference.l1snr_db(est, act, l1_weight=kw["l1_weight"],
-                                 use_regularization=kw["use_reg"])
-        + 0.5 * reference.multi_res_spec_d1(est, act, l1_weight=kw["l1_weight"])),
+                                 use_regularization=kw["use_reg"], ref_level=REF_LEVEL)
+        + 0.5 * reference.multi_res_spec_d1(est, act, l1_weight=kw["l1_weight"],
+                                            spec_ref_level=SPEC_REF_LEVEL)),
 }
 
 
