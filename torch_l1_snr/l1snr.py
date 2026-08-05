@@ -792,20 +792,6 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             if audio_length >= min_len and (audio_length // hop) + 1 >= 2
         ]
 
-    def _validate_audio_length(self, audio_length):
-        """
-        Validates that the audio is long enough for the STFT parameters.
-        """
-        if audio_length < self.min_audio_length:
-            return False
-
-        for n_fft, hop_length in zip(self.n_ffts, self.hop_lengths):
-            n_frames = (audio_length // hop_length) + 1
-            if n_frames < 2:
-                return False
-
-        return True
-
     def forward(self, estimates, actuals, *args, **kwargs):
         _validate_matching_shapes(estimates, actuals)
         device = estimates.device

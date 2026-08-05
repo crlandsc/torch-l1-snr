@@ -33,10 +33,38 @@ def audio(*shape, level=0.05, seed=0):
     return torch.randn(*shape, generator=g) * level
 
 
+def expected(cls, est, act, **kw):
+    """The value `cls` should return, computed from tests/reference.py rather than from the library.
+
+    Exists so that shape, dtype and edge-case tests can assert a *number*. An adversarial reviewer found 40
+    tests here that called a loss and then checked only `ndim == 0`, `not isnan`, or `.dtype` -- all of which
+    a constant satisfies. That is audit finding M2 reappearing in the file written to prevent it.
+    """
+    name = cls.__name__
+    if name == "L1SNRLoss":
+        return reference.l1snr_blended(est, act, l1_weight=kw.get("l1_weight", 0.0),
+                                       ref_level=kw.get("ref_level", 0.05))
+    if name == "L1SNRDBLoss":
+        return reference.l1snr_db(est, act, l1_weight=kw.get("l1_weight", 0.0),
+                                  use_regularization=kw.get("use_regularization", True),
+                                  ref_level=kw.get("ref_level", 0.05))
+    if name == "STFTL1SNRDBLoss":
+        return reference.multi_res_spec_d1(est, act, l1_weight=kw.get("l1_weight", 0.0),
+                                           spec_ref_level=kw.get("spec_ref_level", 0.19 * 0.05))
+    sw = kw.get("spec_weight", 0.5)
+    return ((1.0 - sw) * reference.l1snr_db(est, act, l1_weight=kw.get("l1_weight", 0.0),
+                                            use_regularization=kw.get("use_time_regularization", True),
+                                            ref_level=kw.get("ref_level", 0.05))
+            + sw * reference.multi_res_spec_d1(est, act, l1_weight=kw.get("l1_weight", 0.0),
+                                                spec_ref_level=kw.get("spec_ref_level", 0.19 * 0.05)))
+
+
+
 # ---------------------------------------------------------------------------------------------
 # T1-5 -- validation paths
 # ---------------------------------------------------------------------------------------------
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 @pytest.mark.parametrize("bad", [-0.5, -1e-9, 1.5, 2.0])
 def test_l1_weight_out_of_range_is_rejected(cls, bad):
@@ -46,6 +74,7 @@ def test_l1_weight_out_of_range_is_rejected(cls, bad):
         cls(name="t", l1_weight=bad)
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 @pytest.mark.parametrize("good", [0.0, 0.5, 1.0])
 def test_l1_weight_endpoints_are_accepted(cls, good):
@@ -53,6 +82,7 @@ def test_l1_weight_endpoints_are_accepted(cls, good):
     assert cls(name="t", l1_weight=good) is not None
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("bad", [-0.1, 1.0001, 1.5, 2.0])
 def test_spec_weight_out_of_range_is_rejected(bad):
     """M19, the highest-priority correctness item.
@@ -67,11 +97,13 @@ def test_spec_weight_out_of_range_is_rejected(bad):
         MultiL1SNRDBLoss(name="t", spec_weight=bad)
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("good", [0.0, 0.5, 1.0])
 def test_spec_weight_endpoints_are_accepted(good):
     assert MultiL1SNRDBLoss(name="t", spec_weight=good) is not None
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_time_coefficient_never_goes_negative():
     """M19 stated as the invariant rather than the symptom: no accepted spec_weight may invert the sign."""
     for sw in [0.0, 0.25, 0.5, 0.75, 1.0]:
@@ -79,16 +111,19 @@ def test_time_coefficient_never_goes_negative():
         assert (1.0 - loss_fn.spec_weight) >= 0.0
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_mismatched_stft_parameter_list_lengths_are_rejected():
     with pytest.raises(ValueError, match="same length"):
         STFTL1SNRDBLoss(name="t", n_ffts=[512, 1024], hop_lengths=[128], win_lengths=[512, 1024])
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_win_length_larger_than_n_fft_is_rejected():
     with pytest.raises(ValueError, match="win_length"):
         STFTL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[128], win_lengths=[1024])
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_unknown_window_fn_is_rejected_with_the_valid_options():
     """Q25/A12: surfaced as an opaque AttributeError about a mangled attribute name."""
     with pytest.raises(ValueError) as exc:
@@ -98,6 +133,7 @@ def test_unknown_window_fn_is_rejected_with_the_valid_options():
         assert valid in message, f"the error message does not name {valid!r} as a valid option"
 
 
+@pytest.mark.no_forward  # reads source; never calls forward()
 def test_validation_survives_python_O():
     """M15: the checks must not be bare asserts, which python -O strips.
 
@@ -115,6 +151,7 @@ def test_validation_survives_python_O():
         f"__init__ still validates with bare assert at line(s) {offenders}; python -O would remove it")
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 def test_valid_window_names_all_construct(cls):
     """The five reachable window factories. Guards against a validation fix that is too strict."""
@@ -177,6 +214,7 @@ def test_all_resolutions_failing_returns_a_graph_connected_zero():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         loss = _all_failing_loss()(est, audio(2, 8192, seed=1))
+    assert loss.item() == 0.0, f"the loss should be exactly zero, got {loss.item()}"
     assert loss.grad_fn is not None, "the zero is detached from the graph"
     loss.backward()                                    # must not raise
     assert est.grad is not None
@@ -193,6 +231,8 @@ def test_multi_keeps_a_spectral_gradient_when_all_resolutions_fail():
         warnings.simplefilter("ignore")
         loss = loss_fn(est, audio(2, 8192, seed=1))
     assert loss.requires_grad
+    # with the spectral branch contributing exactly zero, the value is the weighted time term alone
+    assert torch.allclose(loss, 0.5 * reference.l1snr_db(est, audio(2, 8192, seed=1)), atol=1e-5)
     loss.backward()
     assert est.grad is not None
 
@@ -230,6 +270,10 @@ def test_time_domain_losses_do_not_scrub_nan():
     est = torch.full((2, 4096), float("nan"))
     for cls in (L1SNRLoss, L1SNRDBLoss):
         assert torch.isnan(cls(name="t")(est, act)), f"{cls.__name__} unexpectedly scrubbed NaN"
+        # and on finite input the same loss must still be correct, so this test cannot pass against a
+        # constant that merely happens to propagate NaN
+        finite = act + audio(2, 4096, level=0.005, seed=2)
+        assert torch.allclose(cls(name="t")(finite, act), expected(cls, finite, act), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -273,8 +317,12 @@ def test_silence_does_not_produce_nan(case):
         loss = cls(name="t")(e, a)
         assert not torch.isnan(loss), f"{cls.__name__} produced NaN on silent {case}"
         assert not torch.isinf(loss), f"{cls.__name__} produced Inf on silent {case}"
+        assert torch.allclose(loss, expected(cls, e, a), atol=1e-5), (
+            f"{cls.__name__} on silent {case}: {loss.item():.7f} vs reference "
+            f"{expected(cls, e, a).item():.7f}")
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_dbrms_floor_is_below_lmin_for_silence():
     """S10: dbrms_eps=1e-8 puts the floor near -80 dB, deliberately below the lmin=-60 threshold, so a
     digitally silent target is recognized as silent and eta correctly goes to 0."""
@@ -291,7 +339,9 @@ def test_dbrms_floor_is_below_lmin_for_silence():
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 def test_batch_of_one_works(cls):
     est, act = audio(1, 4096), audio(1, 4096, seed=1)
-    assert cls(name="t")(est, act).ndim == 0
+    got = cls(name="t")(est, act)
+    assert got.ndim == 0
+    assert torch.allclose(got, expected(cls, est, act), atol=1e-5)
 
 
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
@@ -305,7 +355,21 @@ def test_empty_batch_raises(cls):
 def test_odd_lengths_work(length):
     est, act = audio(2, length), audio(2, length, seed=1)
     for cls in ALL_CLASSES:
-        assert cls(name="t")(est, act).ndim == 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")      # 999 samples drops the largest resolution
+            got = cls(name="t")(est, act)
+        assert got.ndim == 0
+        if length > 1024:                        # all resolutions usable, so the reference matches
+            assert torch.allclose(got, expected(cls, est, act), atol=1e-5)
+        else:
+            # only the usable resolutions apply, so compare against the reference over that subset
+            ref = (expected(cls, est, act) if cls in (L1SNRLoss, L1SNRDBLoss)
+                   else reference.multi_res_spec_d1(est, act, n_ffts=(512, 1024),
+                                                    hop_lengths=(128, 256), win_lengths=(512, 1024)))
+            if cls is MultiL1SNRDBLoss:
+                ref = 0.5 * reference.l1snr_db(est, act) + 0.5 * reference.multi_res_spec_d1(
+                    est, act, n_ffts=(512, 1024), hop_lengths=(128, 256), win_lengths=(512, 1024))
+            assert torch.allclose(got, ref, atol=1e-5), f"{cls.__name__} at length {length}"
 
 
 @pytest.mark.parametrize("delta", [-1, 0, 1])
@@ -317,6 +381,16 @@ def test_min_audio_length_boundary(delta):
         warnings.simplefilter("ignore")
         loss = STFTL1SNRDBLoss(name="t", min_audio_length=512)(est, act)
     assert loss.ndim == 0 and not torch.isnan(loss)
+    # which resolutions apply is a function of length: n_fft=512 needs 257 samples, 1024 needs 513,
+    # 2048 needs 1025. So 511 falls back entirely, 512 uses one resolution, and 513 uses two.
+    if n < 512:
+        ref = reference.l1snr_db(est, act, use_regularization=False)
+    elif n < 513:
+        ref = reference.spec_blended(est, act, 512, 128, 512)
+    else:
+        ref = reference.multi_res_spec_d1(est, act, n_ffts=(512, 1024), hop_lengths=(128, 256),
+                                          win_lengths=(512, 1024))
+    assert torch.allclose(loss, ref, atol=1e-5), f"length {n}: {loss.item():.6f} vs {ref.item():.6f}"
 
 
 def test_fallback_boundary_is_discontinuous():
@@ -338,7 +412,9 @@ def test_dtype_is_preserved_in_the_time_domain(dtype):
     est = audio(2, 4096).to(dtype)
     act = audio(2, 4096, seed=1).to(dtype)
     for cls in (L1SNRLoss, L1SNRDBLoss):
-        assert cls(name="t")(est, act).dtype == dtype
+        got = cls(name="t")(est, act)
+        assert got.dtype == dtype
+        assert torch.allclose(got, expected(cls, est, act).to(dtype), atol=1e-5)
 
 
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
@@ -350,17 +426,28 @@ def test_float64_is_not_downcast(cls):
     """
     est = audio(2, 4096).double()
     act = audio(2, 4096, seed=1).double()
-    assert cls(name="t")(est, act).dtype == torch.float64
+    got = cls(name="t")(est, act)
+    assert got.dtype == torch.float64
+    assert torch.allclose(got, expected(cls, est, act).double(), atol=1e-5), (
+        "float64 is preserved in dtype but the value is wrong")
 
 
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_half_precision_promotes_to_float32(cls, dtype):
     """Documented AMP behaviour: half precision promotes rather than accumulating in half."""
-    est = audio(2, 4096).to(dtype)
+    # a *correlated* estimate, so the loss sits near -20 dB rather than near 0 dB. With independent
+    # tensors the loss lands at about 1.47, close enough to a stubbed constant of 1.0 to slip through a
+    # tolerance loose enough for half precision.
     act = audio(2, 4096, seed=1).to(dtype)
+    est = (act.float() + audio(2, 4096, level=0.005, seed=2)).to(dtype)
     out = cls(name="t")(est, act)
     assert out.dtype in (torch.float32, dtype), f"unexpected output dtype {out.dtype}"
+    # half precision is lossy, so the tolerance is loose -- but it still separates a real value from a
+    # constant, which is what this needs to do
+    ref = expected(cls, est.float(), act.float())
+    assert torch.allclose(out.float(), ref, rtol=0.05, atol=0.5), (
+        f"{cls.__name__} at {dtype}: {out.item():.4f} vs float32 reference {ref.item():.4f}")
 
 
 def test_non_contiguous_input_works():
@@ -369,7 +456,9 @@ def test_non_contiguous_input_works():
     act = audio(2, 8192, seed=1)[:, ::2]
     assert not est.is_contiguous()
     for cls in ALL_CLASSES:
-        assert cls(name="t")(est, act).ndim == 0
+        got = cls(name="t")(est, act)
+        assert torch.allclose(got, expected(cls, est, act), atol=1e-5), (
+            f"{cls.__name__} gives a different answer on a strided view than the reference")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -448,13 +537,23 @@ def test_frame_count_validation_rejects_audio_shorter_than_the_hop():
     Reachable only when min_audio_length is set below the hop length, so the length check passes and the
     frame-count check is what rejects it.
     """
-    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[2048], hop_lengths=[1024], win_lengths=[2048],
+    # hop must exceed n_fft // 2 for the frame count to be the deciding clause: otherwise the length
+    # requirement (n_fft // 2 + 1) excludes the resolution first and the frame check is never reached.
+    # With n_fft=512 the length requirement is 257, so 300 samples passes it, and hop=512 gives
+    # 300 // 512 + 1 == 1 frame, which is what must reject it.
+    loss_fn = STFTL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[512], win_lengths=[512],
                               min_audio_length=1)
-    assert loss_fn._validate_audio_length(500) is False      # 500 // 1024 + 1 == 1 frame
-    assert loss_fn._validate_audio_length(4096) is True
-    # and the forward path takes the time-domain fallback rather than failing
-    est, act = audio(2, 500), audio(2, 500, seed=1)
-    assert loss_fn(est, act).ndim == 0
+    assert loss_fn._usable_resolutions(300) == [], "the frame-count clause is not rejecting a 1-frame input"
+    assert loss_fn._usable_resolutions(2048) == [0]
+    # _usable_resolutions is the live selector. An earlier version of this test called
+    # _validate_audio_length, which forward had stopped using, so it exercised dead code while the real
+    # frame-count clause went unasserted. That method is now removed.
+    est, act = audio(2, 300), audio(2, 300, seed=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = loss_fn(est, act)
+    assert torch.allclose(got, reference.l1snr_db(est, act, use_regularization=False), atol=1e-5), (
+        "below every resolution's requirement the loss must be the time-domain fallback")
 
 
 def test_time_and_spec_loss_params_override_the_shared_defaults():
@@ -503,7 +602,9 @@ def test_matching_shapes_still_work(shape):
     """A4 must only reject shapes that already differ. Every legitimate call is unaffected."""
     est, act = audio(*shape), audio(*shape, seed=1)
     for cls in ALL_CLASSES:
-        assert cls(name="t")(est, act).ndim == 0
+        got = cls(name="t")(est, act)
+        assert got.ndim == 0
+        assert torch.allclose(got, expected(cls, est, act), atol=1e-5)
 
 
 def test_per_stem_slicing_still_works_after_the_shape_check():
@@ -511,7 +612,8 @@ def test_per_stem_slicing_still_works_after_the_shape_check():
     est, act = audio(2, 4, 2, 4096), audio(2, 4, 2, 4096, seed=1)
     for k in range(4):
         for cls in ALL_CLASSES:
-            assert cls(name="t")(est[:, k], act[:, k]).ndim == 0
+            got = cls(name="t")(est[:, k], act[:, k])
+            assert torch.allclose(got, expected(cls, est[:, k], act[:, k]), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -530,9 +632,11 @@ def test_multi_does_not_warn_above_the_threshold():
     est, act = audio(2, 8192), audio(2, 8192, seed=1)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        MultiL1SNRDBLoss(name="t", min_audio_length=512)(est, act)
+        got = MultiL1SNRDBLoss(name="t", min_audio_length=512)(est, act)
+    assert torch.allclose(got, expected(MultiL1SNRDBLoss, est, act), atol=1e-5)
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("attr", ["n_ffts", "hop_lengths", "win_lengths"])
 def test_mutable_list_defaults_are_not_shared(attr):
     """Q11: the default lists were stored by reference, so two instances aliased the same object and each
@@ -548,6 +652,7 @@ def test_mutable_list_defaults_are_not_shared(attr):
     assert 99999 not in lb, f"mutating one instance's {attr} leaked into another"
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("attr", ["n_ffts", "hop_lengths", "win_lengths"])
 def test_multi_does_not_leak_lists_through_its_spectral_branch(attr):
     """MultiL1SNRDBLoss passes the signature defaults down, so the leak has to be closed at the far end."""
@@ -571,6 +676,7 @@ class _Wrapper(torch.nn.Module):
         self.loss = loss
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("cls", [STFTL1SNRDBLoss, MultiL1SNRDBLoss], ids=lambda c: c.__name__)
 def test_loss_adds_no_keys_to_an_enclosing_state_dict(cls):
     """M8/A8: torchaudio registers the Spectrogram window as a *persistent* buffer, so a ModuleList of them
@@ -581,6 +687,7 @@ def test_loss_adds_no_keys_to_an_enclosing_state_dict(cls):
     assert not added, f"the loss added {len(added)} window buffer(s) to the checkpoint: {sorted(added)}"
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_checkpoint_survives_a_change_of_resolutions():
     """M8's concrete symptom: retuning n_ffts made an earlier checkpoint fail to load."""
     model_a = _Wrapper(STFTL1SNRDBLoss(name="t", n_ffts=[512, 1024, 2048],
@@ -603,6 +710,12 @@ def test_short_audio_keeps_the_regularizer_when_it_was_requested():
         loss = STFTL1SNRDBLoss(name="t", use_regularization=True, min_audio_length=512)(est, act)
     assert loss.item() != 0.0, "a total collapse on short audio still scores zero"
     assert loss.item() > 0.0, "the regularizer should penalize the collapse"
+    # the fallback is a time-domain L1SNRDBLoss whose regularizer is scaled by spec_reg_coef
+    ref = reference.l1snr_db(est, act, use_regularization=True) * 1.0
+    reg_only = ref - reference.l1snr_db(est, act, use_regularization=False)
+    expected_val = reference.l1snr_db(est, act, use_regularization=False) + 0.1 * reg_only
+    assert torch.allclose(loss, expected_val, atol=1e-4), (
+        f"{loss.item():.6f} vs expected {expected_val.item():.6f}")
 
 
 def test_short_audio_regularizer_coefficient_matches_the_stft_path():
@@ -646,6 +759,7 @@ def test_l1snrdb_reg_coef_default_preserves_behaviour():
     (1025, 3),      # n_fft=2048 needs 1025
     (8192, 3),
 ])
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_only_usable_resolutions_are_used(length, expected_used):
     """Keep whichever resolutions are valid rather than discarding all of them.
 
@@ -668,7 +782,8 @@ def test_no_warning_when_every_resolution_is_usable():
     est, act = audio(2, 8192), audio(2, 8192, seed=1)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+        got = STFTL1SNRDBLoss(name="t", min_audio_length=1)(est, act)
+    assert torch.allclose(got, reference.multi_res_spec_d1(est, act), atol=1e-5)
 
 
 def test_dropped_resolution_warning_names_which_ones():
@@ -695,6 +810,7 @@ def test_partial_resolution_use_matches_a_reference_over_the_same_subset():
 # C9, C11
 # ---------------------------------------------------------------------------------------------
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
 def test_l1_weight_cannot_be_mutated_after_construction(cls):
     """Q13: l1_weight was stored in several unsynchronized copies, and mutating the public attribute took
@@ -708,6 +824,7 @@ def test_l1_weight_cannot_be_mutated_after_construction(cls):
         loss.l1_weight = 0.5
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_dbrms_outer_epsilon_removal_is_within_the_stated_bound():
     """Q22/C11: dbrms applied two epsilons of different physical dimension, one inside the sqrt on a power
     quantity and one outside on an amplitude. The outer one is inert because rms is already at least
@@ -726,6 +843,7 @@ def test_dbrms_outer_epsilon_removal_is_within_the_stated_bound():
     assert worst < 1e-3, f"removing the outer epsilon moves dbrms by {worst:.6f} dB, above the stated bound"
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_dbrms_silence_floor_is_exactly_the_power_epsilon():
     """C11 must not regress the -80 dB floor, which per S10 is better matched to lmin=-60 than the authors'
     own -30 dB and is the reason a digitally silent target is recognized as silent.
@@ -815,6 +933,7 @@ def test_ref_level_is_a_calibration_handle():
         f"a smaller ref_level should move the knob further toward L1: {profiles}")
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_spec_ref_level_defaults_to_the_measured_ratio():
     """P0-1: the STFT reference is 5.6x below the time-domain one, measured on 496 real MUSDB stem-chunks.
 
@@ -851,6 +970,7 @@ def test_blend_matches_the_constant_k_reference():
         assert torch.allclose(got, expected, atol=1e-6), f"w={w}: {got.item()} vs {expected.item()}"
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_ref_level_must_be_positive():
     with pytest.raises(ValueError, match="ref_level"):
         L1SNRLoss(name="t", ref_level=0.0)
@@ -858,6 +978,7 @@ def test_ref_level_must_be_positive():
         L1SNRLoss(name="t", ref_level=-0.1)
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
 def test_non_finite_ref_level_is_rejected(bad):
     """A NaN ref_level passes a `<= 0` check because NaN fails every comparison, and then yields a NaN
@@ -878,10 +999,14 @@ def test_inf_ref_level_would_have_silently_disabled_the_l1_term():
     e = a + audio(2, 4096, level=0.005, seed=1)
     pure_snr = L1SNRLoss(name="t", l1_weight=0.0)(e, a)
     blended = L1SNRLoss(name="t", l1_weight=0.5, ref_level=0.05)(e, a)
+    assert torch.allclose(pure_snr, reference.l1snr_blended(e, a, l1_weight=0.0), atol=1e-6)
+    assert torch.allclose(blended, reference.l1snr_blended(e, a, l1_weight=0.5, ref_level=0.05),
+                          atol=1e-6)
     assert not torch.allclose(blended, 0.5 * pure_snr, atol=1e-6), (
         "with a valid ref_level the L1 term must contribute something")
 
 
+@pytest.mark.no_forward  # constructs or inspects only; verified by tests/_forward_counter.py
 def test_window_normalization_is_computed_in_double_precision():
     """The window fold must not degrade float64 accuracy.
 
@@ -941,3 +1066,286 @@ def test_window_fold_preserves_float64_accuracy():
     assert rel < 7e-10, (
         f"float64 relative error against a fully-float64 reference is {rel:.3e}, above the 7e-10 bound; "
         "the window path has lost double precision somewhere")
+
+
+# ---------------------------------------------------------------------------------------------
+# Public parameter wiring. Every test below was added because a mutation campaign showed the
+# parameter could be ignored, mis-wired or retuned with the whole suite still green.
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("spec_weight", [0.0, 0.25, 0.75, 1.0])
+def test_spec_weight_applies_to_the_right_domain(spec_weight):
+    """Swapping the two coefficients in MultiL1SNRDBLoss.forward survived the entire suite.
+
+    Every existing value test used spec_weight=0.5, which is exactly the fixed point of that swap. A user
+    setting 0.8 to emphasize spectral accuracy would have had 0.8 applied to the time domain instead. This is
+    the immediate neighbour of M19, the audit's highest-priority finding.
+    """
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    got = MultiL1SNRDBLoss(name="t", spec_weight=spec_weight)(est, act)
+    time_ref = reference.l1snr_db(est, act, use_regularization=True)
+    spec_ref = reference.multi_res_spec_d1(est, act)
+    assert torch.allclose(got, (1.0 - spec_weight) * time_ref + spec_weight * spec_ref, atol=1e-5), (
+        f"spec_weight={spec_weight} is not being applied to the spectrogram branch")
+    # and the two domains must be distinguishable, or the assertion above proves nothing
+    assert abs(time_ref.item() - spec_ref.item()) > 1.0
+
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+@pytest.mark.parametrize("weight", [0.5, 2.0])
+@pytest.mark.parametrize("l1_weight", [0.0, 0.5, 1.0])
+def test_weight_multiplier_scales_the_loss(cls, weight, l1_weight):
+    """`weight` is a documented public attribute on all four classes and was never passed as anything but
+    1.0 by any test, so dropping it from any return statement survived the suite.
+
+    Parametrized over l1_weight because each class has *several* return paths -- a pure-SNR branch, a blended
+    branch and a pure-L1 shortcut -- each with its own `* self.weight`. A first version of this test used the
+    default l1_weight only and still missed the multiplier being dropped from the pure-L1 shortcut.
+    """
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    base = cls(name="t", l1_weight=l1_weight)(est, act)
+    scaled = cls(name="t", l1_weight=l1_weight, weight=weight)(est, act)
+    assert torch.allclose(scaled, weight * base, atol=1e-5), (
+        f"{cls.__name__}(weight={weight}, l1_weight={l1_weight}) returned {scaled.item():.6f}, expected "
+        f"{weight * base.item():.6f}")
+
+
+def test_spectrogram_regularizer_is_asymmetric_like_the_time_domain_one():
+    """Swapping L_pred and L_true inside _compute_spec_level_matching survived the suite.
+
+    That swap reverses the anti-collapse direction, which is the regularizer's entire purpose: silencing a
+    real target went from costing 30x more than over-levelling it to costing 0.75x. The time domain has this
+    test; it had never been ported to the spectrogram path, where the existing test only asserted that the
+    regularizer changes the loss at all.
+    """
+    act = audio(2, 8192, level=0.1)
+    silent = torch.zeros_like(act)
+    loud = act * 10.0
+    off = STFTL1SNRDBLoss(name="t", use_regularization=False)
+    on = STFTL1SNRDBLoss(name="t", use_regularization=True)
+    under = (on(silent, act) - off(silent, act)).item()
+    over = (on(loud, act) - off(loud, act)).item()
+    assert under > 0 and over > 0
+    assert under > 5.0 * over, (
+        f"silencing a real target should cost far more than over-levelling it, got {under:.5f} vs "
+        f"{over:.5f}; the anti-collapse asymmetry may be inverted")
+
+
+@pytest.mark.parametrize("cls", [L1SNRDBLoss, MultiL1SNRDBLoss], ids=lambda c: c.__name__)
+def test_ref_level_reaches_the_child_losses(cls):
+    """Dropping `ref_level=ref_level` from L1SNRDBLoss's child constructor survived the suite: every test
+    that varied ref_level used L1SNRLoss directly, and the wrappers were only ever given the default."""
+    act = audio(2, 8192)
+    est = act + audio(2, 8192, level=0.005, seed=1)
+    a = cls(name="t", l1_weight=0.5, ref_level=0.05)(est, act)
+    b = cls(name="t", l1_weight=0.5, ref_level=0.005)(est, act)
+    assert not torch.allclose(a, b, atol=1e-4), (
+        f"{cls.__name__} gives the same loss at ref_level 0.05 and 0.005, so the parameter is not reaching "
+        "the component that uses it")
+
+
+def test_lambda_is_stop_gradient():
+    """The `.detach()` on the adaptive weight survived removal.
+
+    An earlier probe missed it because the clamp saturates when the estimate is silent. In the unsaturated
+    regime it is a 41% change in the regularizer's gradient, entirely silent. lambda is a *weight* derived
+    from the levels; letting gradient flow through it changes what the regularizer optimizes.
+    """
+    act = audio(2, 8192, level=0.1)              # about -20 dBFS
+    est = act * 0.316                            # about -30 dBFS: R/denom lands mid-range, no clamp
+    e = est.clone().requires_grad_(True)
+    L1SNRDBLoss(name="t", use_regularization=True)(e, act).backward()
+    with_detach = e.grad.norm().item()
+
+    # The inputs must require grad, or `lam.requires_grad` is False whether or not detach() is there and the
+    # assertion proves nothing. That was the flaw in the first version of this test.
+    live = est.clone().requires_grad_(True)
+    L_pred = reference.dbrms(live)
+    L_true = reference.dbrms(act)
+    assert L_pred.requires_grad, "the test premise is a graph-connected L_pred"
+    lam = L1SNRDBLoss.compute_adaptive_weight(L_pred, L_true, -60.0, 0.1, 0.9,
+                                              (L_pred - L_true).abs())
+    assert not lam.requires_grad, (
+        "compute_adaptive_weight must return a detached weight; lambda is derived from the levels and "
+        "letting gradient flow through it changes what the regularizer optimizes")
+    assert with_detach > 0
+
+
+@pytest.mark.no_forward  # calls the compute_adaptive_weight staticmethod directly
+def test_adaptive_weight_is_bounded_by_lambda0_plus_delta():
+    """Widening the clamp from (0, 1) to (0, 10) survived, multiplying the silence penalty by 1.45.
+
+    lambda must stay within [lambda0, lambda0 + delta_lambda] by construction, or those two parameters stop
+    describing the regularizer's range.
+    """
+    for scale in (1.0, 0.5, 0.1, 0.001, 0.0):
+        act = audio(2, 4096, level=0.1)
+        est = act * scale
+        lam = L1SNRDBLoss.compute_adaptive_weight(
+            reference.dbrms(est), reference.dbrms(act), -60.0, 0.1, 0.9,
+            (reference.dbrms(est) - reference.dbrms(act)).abs())
+        assert lam.min().item() >= 0.1 - 1e-6, f"lambda fell below lambda0 at scale {scale}: {lam.min()}"
+        assert lam.max().item() <= 1.0 + 1e-6, (
+            f"lambda exceeded lambda0 + delta_lambda at scale {scale}: {lam.max().item()}")
+
+
+def test_spectrogram_level_uses_magnitude_not_the_real_part():
+    """Replacing torch.abs(est_spec) with est_spec.real in the spectrogram regularizer survived.
+
+    The level of a complex spectrogram is |S|. Using Re S alone discards the imaginary component and
+    understates the level, which shifts every level-matching penalty.
+    """
+    act = audio(2, 8192, level=0.1)
+    silent = torch.zeros_like(act)
+    penalty = (STFTL1SNRDBLoss(name="t", use_regularization=True)(silent, act)
+               - STFTL1SNRDBLoss(name="t", use_regularization=False)(silent, act)).item()
+    # computed from |S|, independently of the library
+    Sa = reference.normalized_stft(act.reshape(-1, act.shape[-1]), 512, 128, 512)
+    mag = Sa.abs().reshape(act.shape[0], -1)
+    L_true = 20 * torch.log10(torch.sqrt((mag ** 2).mean(dim=-1) + 1e-8) + 1e-8)
+    L_pred = 20 * torch.log10(torch.sqrt(torch.zeros(act.shape[0]) + 1e-8) + 1e-8)
+    R = (L_pred - L_true).abs()
+    lam = reference.adaptive_lambda(L_pred, L_true)
+    one_res = 0.1 * (lam * R).mean().item()
+    assert abs(penalty - one_res) / one_res < 0.35, (
+        f"spectrogram penalty {penalty:.5f} is not consistent with a magnitude-based level "
+        f"(|S| gives about {one_res:.5f} for the n_fft=512 resolution)")
+
+
+@pytest.mark.no_forward  # inspects defaults only
+@pytest.mark.parametrize("param,expected_default,cls", [
+    ("lambda0", 0.1, L1SNRDBLoss),
+    ("delta_lambda", 0.9, L1SNRDBLoss),
+    ("lmin", -60.0, L1SNRDBLoss),
+    ("l1snr_eps", 1e-3, L1SNRDBLoss),
+    ("dbrms_eps", 1e-8, L1SNRDBLoss),
+    ("reg_coef", 1.0, L1SNRDBLoss),
+    ("ref_level", 0.05, L1SNRLoss),
+    ("eps", 1e-3, L1SNRLoss),
+    ("spec_reg_coef", 0.1, STFTL1SNRDBLoss),
+    ("min_audio_length", 512, STFTL1SNRDBLoss),
+    ("spec_weight", 0.5, MultiL1SNRDBLoss),
+    ("spec_reg_coef", 0.1, MultiL1SNRDBLoss),
+])
+def test_documented_defaults_are_pinned(param, expected_default, cls):
+    """Six of these could be retuned with the whole suite green, because every test that used them passed
+    an explicit value and never read the default.
+
+    They are not arbitrary. lmin=-60 at -30 turns the anti-collapse protection almost off for quiet stems
+    (penalty 0.1x); spec_reg_coef=0.1 is load-bearing for A10's claim that the regularizer's weight is
+    continuous across the short-audio fallback boundary; min_audio_length=512 at 1024 silently switches a
+    700-sample input to a different objective. Changing one is a deliberate act that should have to edit
+    this list.
+    """
+    import inspect as _inspect
+    actual = _inspect.signature(cls.__init__).parameters[param].default
+    assert actual == expected_default, (
+        f"{cls.__name__}.{param} default is {actual}, expected {expected_default}. If this change is "
+        "intended, update this test and say why in the commit message.")
+
+
+def test_lmin_default_keeps_anti_collapse_active_for_quiet_targets():
+    """Why lmin=-60 rather than -30, stated as behaviour rather than as a number.
+
+    At -30 a target at -50 dBFS reads as silent, eta goes to zero, and a collapsed estimate is penalized at
+    lambda0 only: measured 0.1x the correct penalty.
+    """
+    act = audio(2, 8192, level=0.003)            # about -50 dBFS
+    silent = torch.zeros_like(act)
+    strict = (L1SNRDBLoss(name="t", use_regularization=True, lmin=-60.0)(silent, act)
+              - L1SNRDBLoss(name="t", use_regularization=False)(silent, act)).item()
+    loose = (L1SNRDBLoss(name="t", use_regularization=True, lmin=-30.0)(silent, act)
+             - L1SNRDBLoss(name="t", use_regularization=False)(silent, act)).item()
+    assert strict > 5.0 * loose, (
+        f"at lmin=-60 a collapsed quiet target should be penalized far harder than at -30, got "
+        f"{strict:.4f} vs {loose:.4f}")
+
+
+def test_non_finite_check_covers_actuals_and_inf():
+    """Both halves of check_finite were untested: every NaN test put the NaN in `estimates` only.
+
+    Dropping the sanitization of `actuals` reintroduces M7 exactly for the target tensor -- an all-NaN
+    target yields a finite-looking loss of -0.0 -- and dropping `isinf` lets an Inf through to a NaN loss.
+    """
+    act = audio(2, 4096)
+    good = act + audio(2, 4096, level=0.005, seed=1)
+    for label, e, a in [
+        ("NaN in actuals", good, torch.full_like(act, float("nan"))),
+        ("Inf in estimates", torch.full_like(good, float("inf")), act),
+        ("Inf in actuals", good, torch.full_like(act, float("inf"))),
+    ]:
+        with pytest.warns(RuntimeWarning, match="non-finite"):
+            loss = STFTL1SNRDBLoss(name="t")(e, a)
+        assert torch.isfinite(loss), f"{label}: loss is {loss.item()}, expected a finite sanitized value"
+
+
+@pytest.mark.parametrize("w", [0.99, 0.999])
+def test_pure_l1_mode_is_exactly_at_one(w):
+    """Loosening the `l1_weight == 1.0` test for pure-L1 mode to `>= 0.99` survived, and at l1_weight=0.99
+    it changes the spectrogram loss from 4.39 to 0.0056 -- a different objective entirely."""
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    for cls in (L1SNRDBLoss, STFTL1SNRDBLoss):
+        assert cls(name="t", l1_weight=w).l1_loss is None, (
+            f"{cls.__name__} entered pure-L1 mode at l1_weight={w}; that mode is only for exactly 1.0")
+        got = cls(name="t", l1_weight=w)(est, act)
+        assert torch.allclose(got, expected(cls, est, act, l1_weight=w), atol=1e-4)
+
+
+def test_spectrogram_regularizer_is_scaled_by_one_minus_l1_weight():
+    """No test combined l1_weight > 0 with use_regularization=True on the STFT path, so dropping the
+    (1 - l1_weight) factor on the spectral regularizer survived."""
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    recon = STFTL1SNRDBLoss(name="t", l1_weight=0.5, use_regularization=False)(est, act)
+    total = STFTL1SNRDBLoss(name="t", l1_weight=0.5, use_regularization=True)(est, act)
+    at_zero_recon = STFTL1SNRDBLoss(name="t", l1_weight=0.0, use_regularization=False)(est, act)
+    at_zero_total = STFTL1SNRDBLoss(name="t", l1_weight=0.0, use_regularization=True)(est, act)
+    reg_at_half = (total - recon).item()
+    reg_at_zero = (at_zero_total - at_zero_recon).item()
+    assert abs(reg_at_half / reg_at_zero - 0.5) < 0.02, (
+        f"the spectral regularizer should be scaled by (1 - l1_weight): at l1_weight=0.5 it contributes "
+        f"{reg_at_half:.6f} against {reg_at_zero:.6f} at 0.0, a ratio of "
+        f"{reg_at_half / reg_at_zero:.3f} rather than 0.5")
+
+
+def test_spectrogram_regularizer_averages_over_usable_resolutions_only():
+    """Dividing the accumulated spectral regularizer by len(n_ffts) instead of valid_transforms survived,
+    because no test combined a partial resolution set with the spectrogram regularizer."""
+    est, act = audio(2, 600), audio(2, 600, seed=1)          # only 2 of 3 resolutions are usable
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        recon = STFTL1SNRDBLoss(name="t", min_audio_length=1, use_regularization=False)(est, act)
+        total = STFTL1SNRDBLoss(name="t", min_audio_length=1, use_regularization=True)(est, act)
+    reg = (total - recon).item()
+    per_res = []
+    for n, h in ((512, 128), (1024, 256)):
+        Sa = reference.normalized_stft(act.reshape(-1, act.shape[-1]), n, h, n)
+        Se = reference.normalized_stft(est.reshape(-1, est.shape[-1]), n, h, n)
+        B = act.shape[0]
+        La = reference.dbrms(Sa.abs().reshape(B, -1))
+        Lp = reference.dbrms(Se.abs().reshape(B, -1))
+        R = (Lp - La).abs()
+        per_res.append((reference.adaptive_lambda(Lp, La) * R).mean().item())
+    expected_reg = 0.1 * sum(per_res) / len(per_res)          # divided by 2 usable, not 3 configured
+    assert abs(reg - expected_reg) / expected_reg < 0.02, (
+        f"spectral regularizer is {reg:.6f}; averaging over the 2 usable resolutions gives "
+        f"{expected_reg:.6f}, over all 3 configured it would give {expected_reg * 2 / 3:.6f}")
+
+
+@pytest.mark.parametrize("latch,make,call", [
+    ("_dropped_warned",
+     lambda: STFTL1SNRDBLoss(name="t", min_audio_length=1),
+     lambda f: f(audio(2, 600), audio(2, 600, seed=1))),
+    ("_fallback_warned",
+     lambda: STFTL1SNRDBLoss(name="t", min_audio_length=512),
+     lambda f: f(audio(2, 400), audio(2, 400, seed=1))),
+])
+def test_one_shot_warnings_really_fire_only_once(latch, make, call):
+    """Every warning docstring promises "Warned once per loss instance", but only the NaN latch was tested.
+    Making the others fire every call survived the suite, which would flood a training log."""
+    loss_fn = make()
+    with pytest.warns(RuntimeWarning):
+        call(loss_fn)
+    assert getattr(loss_fn, latch) is True, f"{latch} was not set"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        call(loss_fn)                     # a second call must be silent

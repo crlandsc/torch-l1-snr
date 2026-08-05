@@ -38,6 +38,12 @@ PUBLISHED_VERSIONS = ["0.0.1", "0.0.2", "0.0.3", "0.0.4", "0.0.5",
                       "0.1.0", "0.1.1", "0.1.2", "0.1.3"]
 
 
+# The README is known to contain this many runnable python examples. Pinned so the gates below cannot
+# silently evaporate: they are parametrized over the discovered blocks, so if the fence syntax changed and
+# the regex stopped matching, pytest would collect zero cases and report success rather than failure.
+EXPECTED_README_EXAMPLES = 6
+
+
 def readme_python_blocks():
     """Fenced ```python blocks that are self-contained programs.
 
@@ -46,6 +52,19 @@ def readme_python_blocks():
     """
     blocks = re.findall(r"```python\n(.*?)```", README, re.DOTALL)
     return [b for b in blocks if "import" in b]
+
+
+def test_readme_example_discovery_still_works():
+    """Guards the gates that depend on discovery, which fail open rather than closed.
+
+    Found by an adversarial reviewer: renaming every ```python fence to ```py made six example gates
+    disappear while CI stayed green.
+    """
+    found = len(readme_python_blocks())
+    assert found == EXPECTED_README_EXAMPLES, (
+        f"README example discovery found {found} runnable blocks, expected {EXPECTED_README_EXAMPLES}. "
+        "Either an example was added or removed (update the constant, deliberately), or the fence syntax "
+        "changed and the example gates are no longer running at all.")
 
 
 # --------------------------------------------------------------------------------------
@@ -325,7 +344,11 @@ def test_py_typed_is_present_and_packaged():
     built wheel, which is where it actually matters.
     """
     assert (REPO / "torch_l1_snr" / "py.typed").exists(), "py.typed marker file is missing"
-    assert "py.typed" in SETUP_CFG, "py.typed is not declared as package_data, so it will not ship"
+    # The declaration is kept as an explicit statement of intent, but note it is not what makes the marker
+    # ship: with a pyproject-declared build backend, setuptools defaults include_package_data to True, so
+    # py.typed lands in the wheel with or without this stanza. Verified by removing it on a clean tree. What
+    # actually guarantees delivery is the wheel-content check in CI, so do not read this line as causal.
+    assert "py.typed" in SETUP_CFG, "the py.typed package_data declaration was removed"
 
 
 def test_copyright_identifier_is_consistent():

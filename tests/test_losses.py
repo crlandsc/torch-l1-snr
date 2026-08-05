@@ -36,36 +36,27 @@ class StemWrappedLoss(torch.nn.Module):
             return self.base_loss(estimates, actuals, *args, **kwargs)
 
 # --- Test Fixtures ---
+#
+# Every fixture is seeded. Unseeded fixtures made detection of a real defect probabilistic: an adversarial
+# reviewer changed the `lmin` default from -60 to -30 and the suite caught it in only 14 of 30 runs. A test
+# that catches a bug half the time is worse than one that never does, because it lands green and then fails
+# an unrelated later change.
 @pytest.fixture
 def dummy_audio():
-    """Provides a batch of dummy audio signals."""
-    estimates = torch.randn(2, 16000)
-    actuals = torch.randn(2, 16000)
+    """A batch of dummy audio signals."""
+    g = torch.Generator().manual_seed(11)
+    estimates = torch.randn(2, 16000, generator=g)
+    actuals = torch.randn(2, 16000, generator=g)
     # Ensure actuals are not all zero to avoid division by zero in loss
-    actuals[0, :100] += 0.1 
+    actuals[0, :100] += 0.1
     return estimates, actuals
 
 @pytest.fixture
 def dummy_stems():
-    """Provides a batch of dummy multi-stem signals."""
-    estimates = torch.randn(2, 4, 1, 16000) # batch, stems, channels, samples
-    actuals = torch.randn(2, 4, 1, 16000)
-    actuals[:, 0, :, :100] += 0.1 # Ensure not all zero
-    return estimates, actuals
-
-@pytest.fixture
-def dummy_stems_3d():
-    """Multi-stem signals: [B, S, T]"""
-    estimates = torch.randn(2, 4, 16000)
-    actuals = torch.randn(2, 4, 16000)
-    actuals[:, 0, :100] += 0.1  # Ensure not all zero
-    return estimates, actuals
-
-@pytest.fixture
-def dummy_stems_4d():
-    """Multi-stem signals: [B, S, C, T]"""
-    estimates = torch.randn(2, 4, 1, 16000)
-    actuals = torch.randn(2, 4, 1, 16000)
+    """A batch of dummy multi-stem signals: [B, S, C, T]"""
+    g = torch.Generator().manual_seed(12)
+    estimates = torch.randn(2, 4, 1, 16000, generator=g)
+    actuals = torch.randn(2, 4, 1, 16000, generator=g)
     actuals[:, 0, :, :100] += 0.1
     return estimates, actuals
 

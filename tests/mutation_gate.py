@@ -8,9 +8,13 @@ f(x) == f(x).
 
 Runs pytest as a subprocess because a test cannot meaningfully assert on the outcome of the run it is part of.
 
-Scope is tests/test_losses.py deliberately. tests/test_docs.py checks documentation strings, which a stubbed
-forward has no bearing on, so including it would dilute the ratio with tests that are not supposed to detect
-this.
+Scope is every numerical test file: tests/test_losses.py and tests/test_edge_cases.py. tests/test_docs.py is
+excluded because it checks documentation strings, which a stubbed forward has no bearing on.
+
+test_edge_cases.py was originally outside this gate, having been added after it. An adversarial reviewer
+applied the same stub to it and found 28% detection against test_losses.py's 100%, with roughly a dozen tests
+of exactly the M2 shape -- asserting only `ndim == 0` or `not isnan`, both of which a constant satisfies. A
+gate that covers one of two test files is a gate over half the suite.
 
 Usage:
     python tests/mutation_gate.py              # uses the default threshold
@@ -24,7 +28,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-TARGET = "tests/test_losses.py"
+TARGETS = ["tests/test_losses.py", "tests/test_edge_cases.py"]
 
 # Set to 1.0 because that is what the rebuilt suite achieves, on CPU and on MPS hardware alike.
 #
@@ -41,8 +45,8 @@ def run_stubbed():
     # invite a fudged threshold. The marker is explicit in the source, so a new test cannot dodge the gate
     # without a reviewer seeing it.
     proc = subprocess.run(
-        [sys.executable, "-m", "pytest", TARGET, "-p", "_mutation_stub", "-q", "--no-header", "--tb=no",
-         "-m", "not no_forward"],
+        [sys.executable, "-m", "pytest", *TARGETS, "-p", "_mutation_stub", "-q", "--no-header",
+         "--tb=no", "-m", "not no_forward"],
         cwd=REPO, capture_output=True, text=True,
         env={**__import__("os").environ, "PYTHONPATH": str(REPO / "tests")},
     )
@@ -53,11 +57,49 @@ def run_stubbed():
     return failed, passed, errors, out
 
 
+def audit_markers():
+    """Verify every no_forward claim by counting actual forward() calls.
+
+    The marker excludes a test from the ratio, so an untrue marker is a hole in the gate. Nothing checked it
+    until an adversarial reviewer pointed out that "a reviewer would see it in the diff" is not a gate.
+    """
+    import json
+    import tempfile
+    out = tempfile.mktemp(suffix=".json")
+    subprocess.run(
+        [sys.executable, "-m", "pytest", *TARGETS, "-p", "_forward_counter", "-q", "--no-header",
+         "--tb=no"],
+        cwd=REPO, capture_output=True, text=True,
+        env={**__import__("os").environ, "PYTHONPATH": str(REPO / "tests"),
+             "FORWARD_COUNTER_OUT": out},
+    )
+    try:
+        records = json.load(open(out))
+    except Exception:
+        print("MARKER AUDIT: could not collect forward-call records")
+        return 1
+    liars = [k for k, v in records.items() if v["marked_no_forward"] and v["forward_calls"] > 0]
+    marked = sum(1 for v in records.values() if v["marked_no_forward"])
+    print(f"marker audit: {marked} tests claim no_forward, {len(records)} tests inspected")
+    if liars:
+        print("\nMARKER AUDIT FAILED: these tests claim no_forward but do call a loss forward():")
+        for k in liars:
+            print(f"  {k}  ({records[k]['forward_calls']} calls)")
+        return 1
+    print("marker audit passed: every no_forward claim is true")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--min", type=float, default=DEFAULT_MIN_FAIL_RATIO)
     ap.add_argument("--report", action="store_true", help="print the ratio and exit 0")
+    ap.add_argument("--audit-markers", action="store_true",
+                    help="verify every no_forward marker by counting forward() calls")
     args = ap.parse_args()
+
+    if args.audit_markers:
+        return audit_markers()
 
     failed, passed, errors, out = run_stubbed()
     total = failed + passed

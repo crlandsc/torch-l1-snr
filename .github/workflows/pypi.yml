@@ -55,6 +55,11 @@ jobs:
       - name: Mutation gate (suite must be able to detect a constant loss)
         run: python tests/mutation_gate.py
 
+      # The no_forward marker excludes a test from the ratio above, so an untrue marker is a hole in the
+      # gate. This counts actual forward() calls and fails if any marked test makes one.
+      - name: Mutation gate marker audit
+        run: python tests/mutation_gate.py --audit-markers
+
       # PEP 561: without py.typed, no type hint in this package reaches a downstream checker, and the
       # marker only matters if it actually ships. Checked by building a wheel and looking inside, rather
       # than by asserting the file exists in the source tree.
