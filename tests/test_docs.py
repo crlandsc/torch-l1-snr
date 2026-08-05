@@ -334,3 +334,20 @@ def test_copyright_identifier_is_consistent():
     assert holder in LICENSE, "LICENSE does not name the expected copyright holder"
     assert holder in SOURCE[:600], f"source header does not use the same identifier as LICENSE ({holder!r})"
     assert holder in SETUP_CFG, "setup.cfg does not use the same identifier as LICENSE"
+
+
+def test_changelog_does_not_overclaim_bit_identical_gradients():
+    """The 0.2.0 entry once said gradients were bit-identical to 0.1.x at the default l1_weight.
+
+    They are not: the window fold and the dbrms epsilon cleanup both change them, and the difference reaches
+    5e-02 relative near convergence. An adversarial reviewer found that claim and it would have sent anyone
+    validating the upgrade by diffing gradients to entirely the wrong conclusion. This gate exists so the
+    claim cannot come back.
+    """
+    breaking = CHANGELOG.split("### BREAKING CHANGES")[1].split("### ")[0]
+    assert "bit-identical values and gradients" not in breaking, (
+        "the CHANGELOG claims bit-identical gradients again; they are not bit-identical")
+    assert "bit-identical loss values" in breaking, (
+        "the CHANGELOG should state precisely what IS bit-identical, namely loss values")
+    assert "Gradients are not bit-identical" in breaking, (
+        "the CHANGELOG must state that gradients differ, since a user may diff them to validate the upgrade")

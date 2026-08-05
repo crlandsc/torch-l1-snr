@@ -4,9 +4,30 @@
 
 ### BREAKING CHANGES
 
-Read this section before upgrading. **Users at the default `l1_weight=0.0` are unaffected numerically**: all
-four losses return bit-identical values and gradients to 0.1.x on that path. The changes below affect the
-blended path, previously-accepted invalid input, and checkpoint keys.
+Read this section before upgrading.
+
+**What happens at the default `l1_weight=0.0`.** All four losses return **bit-identical loss values** to
+0.1.x. **Gradients are not bit-identical** in the two spectrogram classes, nor in `L1SNRDBLoss` with
+regularization enabled, because of the window-normalization fold and the `dbrms` epsilon cleanup described
+further down. The size of the gradient difference depends on how close your estimate already is to the
+target, and it is not small near convergence:
+
+| relative error of the estimate | gradient difference (relative L2) |
+|---|---|
+| 10% | 9e-08 |
+| 1% | 1e-03 |
+| 0.1% | 5e-03 |
+| 0.01% | 1e-02 |
+| 0.001% | 5e-02 |
+
+The mechanism is not instability introduced here. `torch.abs` has a discontinuous subgradient at zero, so
+when a residual bin sits near zero a last-bit change flips its sign and moves that element's gradient by its
+full magnitude. Perturbing 0.1.x's own window by a single floating-point step produces a difference of the
+same order, so this sensitivity is a property of an L1 objective near convergence rather than of this
+release. It is far below the gradient noise of minibatch training, but if you are diffing gradients to
+validate the upgrade, diff them at 10% error rather than at convergence, and expect the table above.
+
+The remaining changes below affect the blended path, previously-accepted invalid input, and checkpoint keys.
 
 **1. `l1_weight > 0` now scales the L1 term by a fixed reference level.**
 
@@ -82,11 +103,10 @@ identical, since the transform is linear in the window, and it removes one full-
 per tensor. Measured +14.2% with a standard deviation of 3.2% across interleaved A/B trials on
 `[8, 2, 264600]`, against a noise floor of 0.5%.
 
-Because the multiply moves inside the transform, float32 results can differ in the last bit: measured
-relative difference 1.6e-07 on gradients, at float32 machine epsilon, with loss values unchanged. Float64
-accuracy slightly **improves**, from 6.2e-10 to 5.2e-10 relative error against a fully-float64 reference,
-because the normalization constant is now computed in double precision. If you are comparing loss values
-across this upgrade to more than six significant figures, this is why they differ.
+Loss values are unchanged bit-for-bit. Gradients are not: see the table in BREAKING CHANGES above, which
+gives the size of the difference as a function of how converged the estimate is. Float64 accuracy slightly
+**improves**, from 6.2e-10 to 5.2e-10 relative error against a fully-float64 reference, because the
+normalization constant is computed in double precision before being cast to the window's dtype.
 
 Two further optimizations were investigated and did not ship, recorded because the reasons are useful:
 

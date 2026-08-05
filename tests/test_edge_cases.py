@@ -856,3 +856,88 @@ def test_ref_level_must_be_positive():
         L1SNRLoss(name="t", ref_level=0.0)
     with pytest.raises(ValueError, match="ref_level"):
         L1SNRLoss(name="t", ref_level=-0.1)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_ref_level_is_rejected(bad):
+    """A NaN ref_level passes a `<= 0` check because NaN fails every comparison, and then yields a NaN
+    scale. On the spectrogram path that surfaces as a loss of -0.0 with a warning blaming the FFT sizes,
+    which sends the user to the wrong place entirely.
+
+    Inf is rejected for the opposite reason: it makes the scale exactly zero, so `l1_weight` silently stops
+    mixing in any L1 while appearing to be set.
+    """
+    for cls in ALL_CLASSES:
+        with pytest.raises(ValueError, match="ref_level"):
+            cls(name="t", l1_weight=0.5, ref_level=bad)
+
+
+def test_inf_ref_level_would_have_silently_disabled_the_l1_term():
+    """Pins why Inf must be rejected rather than merely discouraged: it is indistinguishable from working."""
+    a = audio(2, 4096)
+    e = a + audio(2, 4096, level=0.005, seed=1)
+    pure_snr = L1SNRLoss(name="t", l1_weight=0.0)(e, a)
+    blended = L1SNRLoss(name="t", l1_weight=0.5, ref_level=0.05)(e, a)
+    assert not torch.allclose(blended, 0.5 * pure_snr, atol=1e-6), (
+        "with a valid ref_level the L1 term must contribute something")
+
+
+def test_window_normalization_is_computed_in_double_precision():
+    """The window fold must not degrade float64 accuracy.
+
+    torchaudio builds the window in float32. Dividing it by its own float32 norm rounds twice, and a float64
+    input then inherits that error -- which measurably worsens the float64 path, directly contradicting A9
+    whose purpose is preserving float64. Normalizing in double and casting back avoids the second rounding.
+
+    Reverting that detail passed all 356 tests when this was written, so the fix had no gate. This is it.
+
+    Thresholds here are measured, not assumed: the achievable target is the exact normalization *of the
+    float32 Hann window* (the float32 window itself is torchaudio's choice and not something this fixes).
+    Against that target the stored window is off by 1.86e-09 and a float32 division by 2.06e-09.
+    """
+    stored = STFTL1SNRDBLoss(name="t", n_ffts=[2048], hop_lengths=[512],
+                             win_lengths=[2048]).spectrogram_transforms[0].window
+    w32 = torch.hann_window(2048)
+    target = w32.double() / w32.double().pow(2).sum().sqrt()
+    naive = (w32 / w32.pow(2).sum().sqrt()).double()
+
+    err_stored = (stored.double() - target).abs().max().item()
+    err_naive = (naive - target).abs().max().item()
+    assert err_stored < err_naive, (
+        f"the stored window is no closer to the exact normalized window than a plain float32 division "
+        f"would be ({err_stored:.3e} vs {err_naive:.3e}); the double-precision normalization is gone")
+
+
+def test_window_fold_preserves_float64_accuracy():
+    """The same requirement end to end, against a fully-float64 reference.
+
+    Catches the case where the double-precision normalization survives but a float32 rounding is
+    reintroduced elsewhere in the window path. Threshold measured: the shipped code lands at 5.19e-10 and a
+    float32 division at 9.6e-10, so 7e-10 separates them with margin on both sides.
+    """
+    g = torch.Generator().manual_seed(0)
+    act = (torch.randn(2, 2, 8192, generator=g) * 0.05).double()
+    est = act + (torch.randn(2, 2, 8192, generator=g) * 0.005).double()
+
+    got = STFTL1SNRDBLoss(name="t", n_ffts=[512], hop_lengths=[128], win_lengths=[512])(est, act)
+
+    w = torch.hann_window(512, dtype=torch.float64)
+    B = est.shape[0]
+
+    def spec(v):
+        S = torch.stft(v.reshape(-1, v.shape[-1]), 512, 128, 512, w, center=True, pad_mode="reflect",
+                       normalized=False, onesided=True, return_complex=True) / w.pow(2).sum().sqrt()
+        return S.reshape(B, -1, *S.shape[-2:])
+
+    Se, Sa = spec(est), spec(act)
+    terms = []
+    for pe, pa in ((Se.real, Sa.real), (Se.imag, Sa.imag)):
+        pe, pa = pe.reshape(B, -1), pa.reshape(B, -1)
+        terms.append(10 * torch.log10(((pe - pa).abs().mean(dim=1) + 1e-3)
+                                      / (pa.abs().mean(dim=1) + 1e-3)))
+    truth = (terms[0] + terms[1]).mean()
+
+    rel = abs((got.double() - truth) / truth).item()
+    assert rel < 7e-10, (
+        f"float64 relative error against a fully-float64 reference is {rel:.3e}, above the 7e-10 bound; "
+        "the window path has lost double precision somewhere")

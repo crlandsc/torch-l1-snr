@@ -44,8 +44,20 @@ _STFT_REF_RATIO = 0.19
 
 
 def _validate_ref_level(value):
-    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0.0:
+    """Reject a reference level that cannot produce a usable scale.
+
+    `not (value > 0)` rather than `value <= 0`, because NaN fails every comparison and would otherwise pass:
+    a NaN ref_level yields a NaN scale and, on the spectrogram path, a loss of -0.0 with a warning that
+    blames the FFT sizes. Inf is rejected for the opposite reason: it makes the scale exactly 0, so
+    l1_weight silently stops mixing in any L1 at all.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"ref_level must be a positive number, got {value!r}")
+    if not (value > 0.0) or not math.isfinite(value):
+        raise ValueError(
+            f"ref_level must be a positive finite number, got {value}. It is the typical mean-absolute "
+            "amplitude of your targets; measure it over a few batches."
+        )
 
 
 def _validate_matching_shapes(estimates, actuals):

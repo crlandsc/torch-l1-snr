@@ -233,12 +233,15 @@ So I recommend starting with no standard L1 mixed in (`l1_weight=0.0`), and then
 
 | `l1_weight` | 0.1 | 0.3 | 0.5 | 0.7 | 0.9 |
 |---|---|---|---|---|---|
-| toward L1, near-uniform target levels | 3.6% | 12.5% | 25.0% | 43.7% | 75.0% |
-| toward L1, 40-60 dB level spread | 8.2% | 25.6% | 44.5% | 65.2% | 87.8% |
+| targets at `mean\|y\| ~ 0.05`, i.e. at `ref_level` | **1.1%** | **4.1%** | **9.0%** | 18.7% | 47.1% |
+| targets at `mean\|y\| ~ 0.2`, 4x above `ref_level` | 3.6% | 12.5% | 25.0% | 43.8% | 75.0% |
+| targets at `mean\|y\| ~ 0.5`, 10x above `ref_level` | 8.2% | 25.6% | 44.6% | 65.2% | 87.9% |
 
 So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch. Earlier versions of this README stated these as flat percentages matching the parameter value, which was wrong in both directions depending on the data.
 
-Two practical consequences. Starting at `l1_weight=0.1` introduces less L1 character than the number suggests, so if the knob seems to do nothing, try larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5`, the time-domain component moves about 25% toward L1 while the spectrogram component moves about 45%, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
+**What determines which row applies to you is your target level relative to `ref_level`, not how much your levels vary within a batch.** Level spread turns out to make almost no difference: targets at `mean|y| ~ 0.05` give 9.0% at `l1_weight=0.5` whether the batch is uniform or spans 40 dB. The first row is the one to read if you use the default `ref_level=0.05` on MUSDB-style stems, because that is what the default assumes.
+
+Two practical consequences. Starting at `l1_weight=0.1` introduces far less L1 character than the number suggests -- about 1% at the default -- so if the knob seems to do nothing, try substantially larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5` with targets at `ref_level`, the time-domain component moves about 9% toward L1 while the spectrogram component moves further, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
 
 #### `ref_level`: what the L1 term is scaled against
 
@@ -250,7 +253,7 @@ To set it for your own data, measure the mean absolute value of your targets ove
 
 | `ref_level` | 1.0 | 0.2 | **0.05** | 0.0125 | 0.005 |
 |---|---|---|---|---|---|
-| toward L1 at `l1_weight=0.5` | 3.9% | 16.9% | **44.5%** | 75.2% | 87.2% |
+| toward L1 at `l1_weight=0.5`, targets at `mean\|y\| ~ 0.05` | 0.5% | 2.4% | **9.0%** | 27.2% | 45.7% |
 
 The spectrogram domain uses `spec_ref_level`, which defaults to `0.19 * ref_level`. That ratio is measured: across 496 real stem excerpts the normalized-STFT reference magnitude is about 5.6x below the time-domain one. Setting `spec_ref_level` equal to `ref_level` would be roughly 5x too large and cost about 20 points of knob position at `l1_weight=0.5`, so prefer leaving it derived unless you have measured your own.
 
