@@ -1410,20 +1410,7 @@ def test_new_constructor_params_are_appended_not_inserted():
     the 0.1.3 parameter order as a prefix, so additions have to go at the end.
     """
     import inspect as _inspect
-    # the published 0.1.3 order, in full
-    v013 = {
-        "MultiL1SNRDBLoss": ["name", "weight", "spec_weight", "l1_weight", "use_time_regularization",
-                             "use_spec_regularization", "lambda0", "delta_lambda", "l1snr_eps",
-                             "dbrms_eps", "lmin", "n_ffts", "hop_lengths", "win_lengths", "window_fn",
-                             "min_audio_length", "time_loss_params", "spec_loss_params",
-                             "mps_cpu_fallback"],
-        "L1SNRLoss": ["name", "weight", "eps", "l1_weight"],
-        "L1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
-                        "use_regularization", "l1_weight"],
-        "STFTL1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
-                            "n_ffts", "hop_lengths", "win_lengths", "window_fn", "min_audio_length",
-                            "use_regularization", "spec_reg_coef", "l1_weight", "mps_cpu_fallback"],
-    }
+    v013 = V013_PARAM_ORDER
     for cls in ALL_CLASSES:
         current = [p for p in _inspect.signature(cls.__init__).parameters if p != "self"]
         expected = v013[cls.__name__]
@@ -1431,6 +1418,99 @@ def test_new_constructor_params_are_appended_not_inserted():
             f"{cls.__name__}'s 0.1.3 parameter order is no longer a prefix of its signature. A positional "
             f"call written against 0.1.3 would now mean something different.\n"
             f"  0.1.3:   {expected}\n  current: {current[:len(expected)]}")
+
+
+# The published 0.1.3 constructor order, in full. TRANSCRIBED LISTS ARE THE HAZARD THESE TESTS EXIST FOR: an
+# earlier version omitted `spec_reg_coef` from MultiL1SNRDBLoss, which made a real break look compliant and
+# let a change that moved the parameter pass its own gate. So the lists are themselves checked against the
+# 0.1.3 source in test_the_0_1_3_reference_order_is_itself_correct.
+V013_PARAM_ORDER = {
+        "MultiL1SNRDBLoss": ["name", "weight", "spec_weight", "l1_weight", "use_time_regularization",
+                             "use_spec_regularization", "lambda0", "delta_lambda", "l1snr_eps",
+                             "dbrms_eps", "lmin", "n_ffts", "hop_lengths", "win_lengths", "window_fn",
+                             "min_audio_length", "spec_reg_coef", "time_loss_params", "spec_loss_params",
+                             "mps_cpu_fallback"],
+        "L1SNRLoss": ["name", "weight", "eps", "l1_weight"],
+        "L1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
+                        "use_regularization", "l1_weight"],
+        "STFTL1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
+                            "n_ffts", "hop_lengths", "win_lengths", "window_fn", "min_audio_length",
+                            "use_regularization", "spec_reg_coef", "l1_weight", "mps_cpu_fallback"],
+}
+
+# Last commit at version 0.1.3, the only version published to PyPI when 0.2.0 was prepared.
+_V013_COMMIT = "15b2458"
+
+
+def _param_order_at_0_1_3():
+    """Read the four constructor signatures out of the 0.1.3 source, or return None if git cannot reach it.
+
+    Returns None rather than a partial answer: a check that silently compares against the wrong commit is
+    worse than no check, and this whole family of tests exists because a wrong reference passed once.
+    """
+    import ast
+    import subprocess
+    def _show(path):
+        return subprocess.run(["git", "show", f"{_V013_COMMIT}:{path}"], capture_output=True, text=True,
+                              cwd=str(pathlib.Path(__file__).resolve().parent.parent))
+    version = _show("torch_l1_snr/__init__.py")
+    if version.returncode != 0 or '__version__ = "0.1.3"' not in version.stdout:
+        return None  # not a git checkout, shallow clone, or not the commit we think it is
+    src = _show("torch_l1_snr/l1snr.py")
+    if src.returncode != 0:
+        return None
+    orders = {}
+    for node in ast.walk(ast.parse(src.stdout)):
+        if isinstance(node, ast.ClassDef) and node.name in V013_PARAM_ORDER:
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                    orders[node.name] = [a.arg for a in item.args.args][1:]
+    return orders or None
+
+
+@pytest.mark.no_forward  # reads signatures out of git history
+def test_the_0_1_3_reference_order_is_itself_correct():
+    """The reference list above is hand-written, and a hand-written reference can be wrong.
+
+    It was: `spec_reg_coef` was omitted from MultiL1SNRDBLoss, so the prefix check above compared the
+    signature against a 19-parameter fiction and passed while position 17 genuinely moved. Nothing in the
+    suite could see it, because the fiction was the only stated ground truth. This gate makes the 0.1.3
+    source the authority.
+    """
+    actual = _param_order_at_0_1_3()
+    if actual is None:
+        pytest.skip(f"cannot read {_V013_COMMIT} from git; the reference list is unverifiable here")
+    for name, expected in V013_PARAM_ORDER.items():
+        assert actual[name] == expected, (
+            f"the transcribed 0.1.3 order for {name} does not match commit {_V013_COMMIT}.\n"
+            f"  transcribed: {expected}\n  actual 0.1.3: {actual[name]}")
+
+
+@pytest.mark.no_forward  # constructs only; the override lands in a child module, not in a loss value
+def test_a_full_positional_call_written_against_0_1_3_still_means_the_same_thing():
+    """The behavioural form of the prefix check, and the one that actually caught the break.
+
+    A user who passed every 0.1.3 parameter positionally -- 20 of them on MultiL1SNRDBLoss, with
+    `time_loss_params` at position 18 -- must still get their override applied. When `spec_reg_coef` moved
+    from 17 to the end, this call raised `TypeError: 'float' object is not iterable`, because position 18
+    stopped being a dict. A quieter version of the same bug discards the override without any error.
+    """
+    order = V013_PARAM_ORDER["MultiL1SNRDBLoss"]
+    defaults = {
+        "name": "vocals", "weight": 1.0, "spec_weight": 0.5, "l1_weight": 0.0,
+        "use_time_regularization": True, "use_spec_regularization": False, "lambda0": 1.0,
+        "delta_lambda": 1.0, "l1snr_eps": 1e-3, "dbrms_eps": 1e-8, "lmin": -60.0,
+        "n_ffts": [4096, 2048, 1024], "hop_lengths": [1024, 512, 256],
+        "win_lengths": [4096, 2048, 1024], "window_fn": "hann", "min_audio_length": 512,
+        "spec_reg_coef": 0.1, "time_loss_params": {"lmin": -40.0}, "spec_loss_params": None,
+        "mps_cpu_fallback": True,
+    }
+    assert set(defaults) == set(order), "the positional fixture has drifted from the 0.1.3 parameter list"
+    loss = MultiL1SNRDBLoss(*[defaults[p] for p in order])
+    assert loss.time_loss.lmin == -40.0, (
+        "a 20-argument positional call written against 0.1.3 no longer applies the caller's "
+        f"time_loss_params; lmin is {loss.time_loss.lmin}, not the -40.0 passed at position "
+        f"{order.index('time_loss_params') + 1}")
 
 
 def test_all_resolutions_failed_warning_is_one_shot():

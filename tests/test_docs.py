@@ -434,6 +434,76 @@ def test_check_finite_is_on_both_stft_classes_and_documented():
         "behaviour it switches off")
 
 
+def test_the_changelog_does_not_advertise_the_reverted_device_guard():
+    """The device-move guard was reverted, but the Performance section still sold it as a shipped win.
+
+    The revert and the CHANGELOG were one commit apart and nothing connected them, so the release notes
+    promised an optimization the wheel does not contain -- and specifically the one that silently zeroed the
+    spectral loss. This gate ties the prose to the code: the guard may be described only as something that
+    did not ship. It deliberately does not ban the "0.02 ms" figure, which is honest in that context.
+    """
+    assert "guarded rather than unconditional" not in CHANGELOG, (
+        "the CHANGELOG presents the per-call device guard as shipped; it was reverted in b534e73 because a "
+        "stale cache made the spectral loss return exactly 0.0 after nn.Module.to()")
+    if "device move" in CHANGELOG:
+        did_not_ship = CHANGELOG.index("did not ship")
+        assert CHANGELOG.index("device move") > did_not_ship, (
+            "the device move is discussed before the did-not-ship list, which reads as a shipped change")
+
+
+@pytest.mark.no_forward  # compares signatures across two commits
+def test_the_0_1_4_entry_is_right_that_no_signature_changed():
+    """0.1.4's entry claims every signature is identical to 0.1.3. That claim used to be false in its own
+    text -- it carved out `MultiL1SNRDBLoss` "gaining a `spec_reg_coef` pass-through" that 0.1.3 already had
+    and already forwarded. The carve-out was wrong, so the plain claim is the true one. Verified against the
+    two commits rather than trusted, because 0.1.4 lives on a branch this suite does not otherwise touch.
+    """
+    import ast
+    import subprocess
+    root = str(Path(__file__).resolve().parent.parent)
+
+    def order_at(commit):
+        out = subprocess.run(["git", "show", f"{commit}:torch_l1_snr/l1snr.py"],
+                             capture_output=True, text=True, cwd=root)
+        if out.returncode != 0:
+            return None
+        found = {}
+        for node in ast.walk(ast.parse(out.stdout)):
+            if isinstance(node, ast.ClassDef) and node.name.endswith("Loss"):
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                        found[node.name] = [a.arg for a in item.args.args][1:]
+        return found or None
+
+    v013, v014 = order_at("15b2458"), order_at("2452d72")
+    if v013 is None or v014 is None:
+        pytest.skip("cannot read the 0.1.3/0.1.4 commits from git")
+    assert v014 == v013, (
+        "the 0.1.4 entry claims no signature changed, but it did:\n" +
+        "\n".join(f"  {k}: 0.1.3 {v013.get(k)} -> 0.1.4 {v014.get(k)}"
+                  for k in set(v013) | set(v014) if v013.get(k) != v014.get(k)))
+    entry = CHANGELOG[CHANGELOG.index("## 0.1.4"):CHANGELOG.index("## 0.1.3")]
+    assert "gaining a `spec_reg_coef` pass-through" not in entry, (
+        "the 0.1.4 entry still carves out a spec_reg_coef pass-through as new; 0.1.3 already had the "
+        "parameter at position 17 and already forwarded it to the spectrogram loss")
+
+
+def test_the_changelog_states_positional_compatibility_as_a_guarantee():
+    """Preserving 0.1.3's parameter order is a compatibility guarantee, not a breaking change.
+
+    An earlier version listed it as BREAKING item 4 and described a reordering that 0.1.4 never made -- the
+    reordering was introduced by the "fix" itself. A user reading that would go looking for a migration they
+    do not need, in the one section they are told to read before upgrading.
+    """
+    breaking = CHANGELOG[CHANGELOG.index("### BREAKING CHANGES"):CHANGELOG.index("### Performance")]
+    assert "keep their meaning" in breaking, (
+        "the BREAKING section must state that positional calls written against 0.1.3 still mean the same "
+        "thing; it is the first thing a cautious upgrader checks")
+    assert "briefly inserted" not in CHANGELOG, (
+        "the CHANGELOG describes a mid-signature insertion in 0.1.4 that never happened; 0.1.4's signatures "
+        "are identical to 0.1.3's")
+
+
 def test_no_superseded_figures_survive_in_the_documentation():
     """Specific numbers that measurement retired. Each was published, then shown wrong.
 

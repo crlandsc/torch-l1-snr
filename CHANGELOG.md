@@ -50,6 +50,12 @@ fail and tell you nothing useful.
 
 The remaining changes below affect the blended path, previously-accepted invalid input, and checkpoint keys.
 
+**Positional constructor calls written against 0.1.3 keep their meaning.** Every parameter 0.1.3 shipped is
+in its original position on all four classes, and the parameters new in 0.2.0 come after them, so 0.1.3's
+order is a strict prefix. Two tests pin this: one compares each signature against the 0.1.3 source in git,
+and one constructs `MultiL1SNRDBLoss` with all 20 of its 0.1.3 arguments positionally and checks the
+override still lands. Use keyword arguments anyway -- these constructors take 23 parameters.
+
 **1. `l1_weight > 0` now scales the L1 term by a fixed reference level.**
 
 The scale was `c * mean_b(1 / (mean|y|_b + eps))`, a mean of reciprocals computed over the batch. That had two
@@ -92,20 +98,12 @@ not expect. Load with `strict=False`, or filter those keys out first.
 Validation now raises `ValueError` rather than using bare `assert`, which `python -O` strips. Under 0.1.x with
 `-O`, out-of-range values produced a silently wrong loss.
 
-**4. `MultiL1SNRDBLoss`'s new constructor parameters are appended, not inserted.**
-
-0.1.4 briefly inserted `spec_reg_coef` at position 17, before `time_loss_params`. A 17-argument *positional*
-call written against 0.1.3 then constructed and ran with no error while the caller's `time_loss_params` dict
-landed in `spec_reg_coef` and their overrides were silently discarded. All parameters added since 0.1.3 now
-follow `mps_cpu_fallback`, so 0.1.3's parameter order is a strict prefix of the current one and positional
-calls keep their meaning. A test pins that order.
-
-**5. `l1_weight` is read-only after construction.**
+**4. `l1_weight` is read-only after construction.**
 
 It is baked into child modules and mode flags when the loss is built, so assigning to it changed the number
 without changing the behaviour it had already determined. Construct a new loss instead.
 
-**6. Short-audio and dtype behaviour changed.**
+**5. Short-audio and dtype behaviour changed.**
 
 - `STFTL1SNRDBLoss(use_regularization=True)` below `min_audio_length` previously dropped the regularizer
   silently. A total collapse then scored exactly `0.000000`, which is the failure the regularizer exists to
@@ -164,9 +162,14 @@ Two further optimizations were investigated and did not ship, recorded because t
 - Sharing one STFT between the reconstruction and regularizer paths: **there was nothing to share.** A call
   counter shows six transform calls with the regularizer enabled and six with it disabled, so the transform
   was never recomputed. The premise was wrong.
-
-The per-call device move on the spectrogram transforms is now guarded rather than unconditional, worth about
-0.02 ms.
+- Guarding the per-call device move on the spectrogram transforms against a cached device, worth 0.02 ms
+  (about 0.007% of a forward). The cache was set in `__init__` and written only in `forward`, but
+  `nn.Module.to()` moves the window buffers without touching a plain Python attribute, so after
+  `loss.to(device)` the guard skipped a move that was needed, every resolution failed on a device mismatch,
+  and the loss became exactly `0.0` with a zero gradient. On Apple silicon that was the default path, because
+  `mps_cpu_fallback` puts the input on CPU while the buffers are on MPS. A correct guard is possible by
+  reading the buffer's device instead of a cache; 0.007% does not justify an invariant whose violation
+  silently zeroes a training signal.
 
 ### Other changes
 
@@ -185,8 +188,8 @@ The per-call device move on the spectrogram transforms is now guarded rather tha
 ## 0.1.4 (unreleased)
 
 Documentation accuracy and packaging hygiene. **No behavioral change**: no loss value, gradient, or API
-signature changes in this release, apart from `MultiL1SNRDBLoss` gaining a `spec_reg_coef` pass-through
-whose default matches the value already used internally.
+signature change in this release. All four constructor signatures are identical to 0.1.3, parameter for
+parameter and position for position.
 
 **Documentation corrections.** Several documented claims did not match the implementation:
 
@@ -229,7 +232,8 @@ whose default matches the value already used internally.
   `10*log10(eps / (mean|y| + eps))`, so a target near -58 dBFS RMS has under 3 dB of usable loss range.
 - **Documented `dbrms`**, which was exported in `__all__` but appeared nowhere in the README.
 - **Documented 10 constructor parameters** that were missing from their class docstrings, including
-  `spec_reg_coef`, which was also unreachable from `MultiL1SNRDBLoss` except through `spec_loss_params`.
+  `spec_reg_coef`. It was already a constructor parameter of `MultiL1SNRDBLoss` in 0.1.3 and already
+  forwarded to the spectrogram loss; only its documentation was missing.
 - **Added attribution** for the authors' reference implementations, `kwatcharasupat/bandit` (Apache-2.0) and
   `kwatcharasupat/query-bandit` (MIT, Copyright (c) 2024 Karn Watcharasupat), alongside the papers.
 - **Fixed the citation for arXiv:2309.02539**, published in IEEE Open Journal of Signal Processing vol. 5,

@@ -1107,16 +1107,18 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         win_lengths: List[int] = [512, 1024, 2048],
         window_fn: str = 'hann',
         min_audio_length: int = 512,
+        # Position 17 in published 0.1.3, and it must stay here. Moving it to the end to "append new
+        # parameters" was itself the break: it shifted time_loss_params from 18 to 17, so a full
+        # 20-argument positional call written against 0.1.3 passed a float where a dict was expected.
+        # 0.1.3 is the baseline every user actually has -- nothing before 0.2.0 may be reordered.
+        spec_reg_coef: float = 0.1,
         # Allow for separate parameter overrides (e.g. different delta_lambda for time and spec)
         time_loss_params: Optional[dict] = None,
         spec_loss_params: Optional[dict] = None,
         # MPS workaround
         mps_cpu_fallback: bool = True,
-        # New in 0.1.4/0.2.0, appended so that positional calls written against 0.1.3 keep their
-        # meaning. Inserting mid-signature silently reinterpreted a 17-argument positional call:
-        # time_loss_params landed in spec_reg_coef and the user's overrides were discarded without
-        # error. Keep additions here.
-        spec_reg_coef: float = 0.1,
+        # New in 0.2.0, appended so that positional calls written against 0.1.3 keep their meaning.
+        # Keep additions here, after every parameter 0.1.3 shipped.
         ref_level: float = 0.05,
         spec_ref_level: Optional[float] = None,
         check_finite: bool = True,
