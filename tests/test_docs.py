@@ -495,7 +495,9 @@ def test_the_readme_documents_the_three_inherent_properties():
     """
     limits = README[README.index("## Limitations"):README.index("## Contributing")]
     for topic, needles in [
-        ("the non-monotone spectrogram loss", ["monotone", "-22.4", "DC offset"]),
+        # The mechanism, not just the fact. The first version of this entry said the eps floor *caused* the
+        # inversion; eps in fact caps it, and there is a second cause (bin dilution) the entry omitted.
+        ("the non-monotone spectrogram loss", ["monotone", "-23.6", "DC offset", "limits", "dilutes"]),
         ("the float32 dbrms overflow", ["overflow", "2.5e16", "float64"]),
         ("no regularizer gradient at silence", ["digital silence", "exactly zero"]),
     ]:

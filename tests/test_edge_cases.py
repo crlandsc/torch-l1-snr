@@ -1500,12 +1500,19 @@ def test_a_single_resolution_in_a_list_is_still_valid():
 def test_the_spectrogram_loss_is_not_monotone_and_the_docs_say_so():
     """Pins the inversion itself, so the documented claim cannot quietly stop being true.
 
-    A DC offset produces almost no imaginary error, so `D1_im` saturates at the eps floor and pays a fixed
-    reward any near-purely-real error collects. The result is an estimate the time domain rates ~10 dB worse
-    scoring ~5 dB better on the spectrogram loss. This is a property of the published Re+Im objective --
-    confirmed against tests/reference.py -- so the gate exists to keep the documentation honest, not to
-    forbid the behaviour. If a future change makes the loss monotone here, this test should fail and the
-    README's Limitations entry should come out with it.
+    An estimate the time domain rates ~10 dB worse scores ~6 dB better on the spectrogram loss. Two
+    independent causes, both from mean-reducing a D1 over spectrogram components:
+
+    1. A real-valued error is nearly invisible to the imaginary term (`mean|err_im|` 4.9e-09 against
+       `mean|err_re|` 2.7e-03 for the DC case). `l1snr_eps` *limits* this rather than causing it, by flooring
+       how large the free pass can be -- at eps=0 the gap widens from 5.9 dB to 57.8 dB. An earlier version of
+       this docstring had that backwards, and the README repeated it.
+    2. The mean over bins dilutes a concentrated error: 66.7% of the DC error's magnitude is in 1 of 1025
+       bins. This survives reformulating on the complex modulus, so that is not a fix.
+
+    Neither is forced by the bit-exactness requirement, which covers only the time-domain D1 and is checked
+    by instantiating L1SNRLoss alone. The spectral path computes its own d1_re/d1_im and could be changed
+    without touching it. The gate exists to keep the documentation honest, not to forbid the behaviour.
     """
     torch.manual_seed(7)
     act = torch.randn(4, 2, 44100) * 0.05
@@ -1521,6 +1528,15 @@ def test_the_spectrogram_loss_is_not_monotone_and_the_docs_say_so():
     assert spec_dc < spec_noise, (
         f"the spectrogram loss no longer inverts the ordering (DC {spec_dc:.2f} vs noise {spec_noise:.2f}); "
         "if this is deliberate, remove the Limitations entry that documents it")
+    # Pin the direction of eps's role, since the docs asserted the opposite. A smaller eps must make the
+    # inversion WORSE, because eps caps the reward a near-zero imaginary error collects.
+    wide = STFTL1SNRDBLoss("s", l1snr_eps=1e-9)
+    gap_default = spec_noise - spec_dc
+    gap_small_eps = wide(noise, act).item() - wide(dc, act).item()
+    assert gap_small_eps > gap_default, (
+        f"a smaller l1snr_eps narrowed the inversion ({gap_small_eps:.2f} vs {gap_default:.2f} dB), so eps "
+        "is not acting as the cap the documentation now describes")
+
     # and the combined default must still order them correctly, which is why it is the recommended entry point
     multi_dc = MultiL1SNRDBLoss("m")(dc, act).item()
     multi_noise = MultiL1SNRDBLoss("m")(noise, act).item()

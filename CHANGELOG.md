@@ -222,12 +222,14 @@ Several documented claims did not match the implementation:
 
 - **Documented three inherent properties an edge-case sweep surfaced.** None is a code change; each is a
   behaviour a user can hit and could not have predicted from the previous text. `STFTL1SNRDBLoss` alone is
-  **not monotone in reconstruction quality**, because the `eps` floor applies per component: a DC offset
-  produces almost no imaginary error, so `D1_im` saturates and pays a fixed reward. On `[4, 2, 44100]` at
-  amplitude 0.05 a DC offset equal to the signal amplitude scores -22.4 dB where 10% white noise scores
-  -17.6 dB, though the time-domain D1 rates the DC error about 10 dB worse. Confirmed against an independent
-  reference, so it is a property of the published real-plus-imaginary objective and changing it would break
-  D1's bit-exactness with the authors' code. `dbrms` **overflows in float32** once `|x|` reaches about 2.5e16
+  **not monotone in reconstruction quality**: on `[4, 2, 44100]` at amplitude 0.05 a DC offset equal to the
+  signal amplitude scores -23.6 dB where 10% white noise scores -17.6 dB, though the time-domain D1 rates the
+  DC error about 10 dB worse. Two independent causes, both from mean-reducing a D1 over spectrogram
+  components. A real-valued error is nearly invisible to the imaginary term (`mean|err_im|` 4.9e-09 against
+  `mean|err_re|` 2.7e-03), and `l1snr_eps` *limits* that rather than causing it -- at `eps=0` the gap widens
+  from 5.9 dB to 57.8 dB. Separately, the mean over bins dilutes a concentrated error: 66.7% of the DC error
+  sits in 1 of 1025 bins, which is why reformulating on the complex modulus does not fix it.
+  `MultiL1SNRDBLoss` at the default `spec_weight=0.5` orders both pairs correctly. `dbrms` **overflows in float32** once `|x|` reaches about 2.5e16
   at realistic shapes, because `mean(x**2)` squares before reducing; the inputs stay finite so `check_finite`
   cannot see it. And the level-matching regularizer has **exactly zero gradient at digital silence**, since
   `d/dx sqrt(mean(x^2) + eps)` is 0 at 0, so escape pressure at a fully collapsed output comes from the D1
