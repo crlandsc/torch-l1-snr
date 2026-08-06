@@ -1458,6 +1458,37 @@ def test_a_negative_coefficient_raises(param):
 
 
 @pytest.mark.no_forward  # constructor validation; never reaches a forward
+@pytest.mark.parametrize("value", ["0.05", None, [0.05], {"v": 0.05}])
+@pytest.mark.parametrize("param", ["ref_level", "weight", "l1snr_eps", "l1_weight", "spec_weight"])
+def test_a_non_numeric_parameter_raises_rather_than_failing_later(param, value):
+    """A config file hands you strings. `ref_level="0.05"` from YAML is the realistic case.
+
+    Each validator had a type-rejection branch that nothing exercised, so the four of them were free to
+    disagree about non-numeric input. A string compares fine against 0.0 and 1.0 in Python 2 semantics but
+    raises TypeError here, and the traceback would surface from deep inside the loss rather than naming the
+    parameter.
+    """
+    if param == "ref_level" and value is None:
+        pytest.skip("None is the documented sentinel for a derived spec_ref_level, not an error")
+    with pytest.raises(ValueError, match=param):
+        MultiL1SNRDBLoss(name="m", **{param: value})
+
+
+@pytest.mark.no_forward  # constructor validation; never reaches a forward
+def test_an_explicit_spec_ref_level_is_validated_on_the_combined_loss():
+    """`spec_ref_level` defaults to None and is derived, so the explicit branch went unexercised.
+
+    It is the parameter most likely to be set by hand, since the README tells you to measure it, and it is
+    the one whose bad values are silent: 0 divides, Inf makes the L1 term exactly zero.
+    """
+    for bad in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="ref_level"):
+            MultiL1SNRDBLoss(name="m", spec_ref_level=bad)
+    ok = MultiL1SNRDBLoss(name="m", spec_ref_level=0.0095)
+    assert ok.spec_ref_level == 0.0095
+
+
+@pytest.mark.no_forward  # constructor validation; never reaches a forward
 @pytest.mark.parametrize("param", ["l1snr_eps", "dbrms_eps"])
 def test_a_non_positive_epsilon_raises(param):
     """An epsilon of zero or below defeats the stability it exists for; neither was checked."""
