@@ -451,49 +451,31 @@ def test_the_changelog_does_not_advertise_the_reverted_device_guard():
             "the device move is discussed before the did-not-ship list, which reads as a shipped change")
 
 
-@pytest.mark.no_forward  # compares signatures across two commits
-def test_the_0_1_4_entry_is_right_that_no_signature_changed():
-    """0.1.4's entry claims every signature is identical to 0.1.3. That claim used to be false in its own
-    text -- it carved out `MultiL1SNRDBLoss` "gaining a `spec_reg_coef` pass-through" that 0.1.3 already had
-    and already forwarded. The carve-out was wrong, so the plain claim is the true one. Verified against the
-    two commits rather than trusted, because 0.1.4 lives on a branch this suite does not otherwise touch.
+def test_the_changelog_has_exactly_one_unreleased_entry():
+    """0.1.4 was prepared as a separate release and then folded into 0.2.0, since nothing past 0.1.3 shipped.
+
+    A leftover `## 0.1.4` section would describe a version nobody can install, and would split the upgrade
+    story for the only upgrade that exists: 0.1.3 to 0.2.0. It would also strand that section's own claim
+    that all four signatures match 0.1.3 exactly, which is true of the abandoned tree and false of 0.2.0.
     """
-    import ast
-    import subprocess
-    root = str(Path(__file__).resolve().parent.parent)
-
-    def order_at(commit):
-        out = subprocess.run(["git", "show", f"{commit}:torch_l1_snr/l1snr.py"],
-                             capture_output=True, text=True, cwd=root)
-        if out.returncode != 0:
-            return None
-        found = {}
-        for node in ast.walk(ast.parse(out.stdout)):
-            if isinstance(node, ast.ClassDef) and node.name.endswith("Loss"):
-                for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == "__init__":
-                        found[node.name] = [a.arg for a in item.args.args][1:]
-        return found or None
-
-    v013, v014 = order_at("15b2458"), order_at("2452d72")
-    if v013 is None or v014 is None:
-        pytest.skip("cannot read the 0.1.3/0.1.4 commits from git")
-    assert v014 == v013, (
-        "the 0.1.4 entry claims no signature changed, but it did:\n" +
-        "\n".join(f"  {k}: 0.1.3 {v013.get(k)} -> 0.1.4 {v014.get(k)}"
-                  for k in set(v013) | set(v014) if v013.get(k) != v014.get(k)))
-    entry = CHANGELOG[CHANGELOG.index("## 0.1.4"):CHANGELOG.index("## 0.1.3")]
-    assert "gaining a `spec_reg_coef` pass-through" not in entry, (
-        "the 0.1.4 entry still carves out a spec_reg_coef pass-through as new; 0.1.3 already had the "
-        "parameter at position 17 and already forwarded it to the spectrogram loss")
+    unreleased = re.findall(r"^## (\S+) \(unreleased\)", CHANGELOG, re.MULTILINE)
+    assert unreleased == ["0.2.0"], (
+        f"expected exactly one unreleased entry for 0.2.0, found {unreleased}; every change since 0.1.3 "
+        "belongs in the single entry a 0.1.3 user will read")
+    assert not re.search(r"^## 0\.1\.4", CHANGELOG, re.MULTILINE), (
+        "there is a 0.1.4 section; that version was never published and 0.2.0 contains all of its content")
+    assert "signature change in this release. All four constructor signatures are identical to 0.1.3" \
+        not in CHANGELOG, (
+        "0.1.4's summary claim survived the merge into 0.2.0, which does append parameters and so is not "
+        "signature-identical to 0.1.3")
 
 
 def test_the_changelog_states_positional_compatibility_as_a_guarantee():
     """Preserving 0.1.3's parameter order is a compatibility guarantee, not a breaking change.
 
-    An earlier version listed it as BREAKING item 4 and described a reordering that 0.1.4 never made -- the
-    reordering was introduced by the "fix" itself. A user reading that would go looking for a migration they
-    do not need, in the one section they are told to read before upgrading.
+    An earlier version listed it as BREAKING item 4 and described a mid-signature insertion that never
+    happened -- the reordering was introduced by the "fix" itself. A user reading that would go looking for a
+    migration they do not need, in the one section they are told to read before upgrading.
     """
     breaking = CHANGELOG[CHANGELOG.index("### BREAKING CHANGES"):CHANGELOG.index("### Performance")]
     assert "keep their meaning" in breaking, (

@@ -185,19 +185,17 @@ Two further optimizations were investigated and did not ship, recorded because t
   counter superseded by the warning above.
 
 
-## 0.1.4 (unreleased)
 
-Documentation accuracy and packaging hygiene. **No behavioral change**: no loss value, gradient, or API
-signature change in this release. All four constructor signatures are identical to 0.1.3, parameter for
-parameter and position for position.
 
-**Documentation corrections.** Several documented claims did not match the implementation:
+### Documentation corrections
+
+Several documented claims did not match the implementation:
 
 - **All README examples now run.** Four of the five runnable examples raised
   `RuntimeError: element 0 of tensors does not require grad` on `loss.backward()`, because the example
   tensors were built without `requires_grad=True`. A fifth omitted `.backward()` entirely. Every example is
   now executed by the test suite so they cannot regress.
-- **Corrected the v0.1.3 MPS root cause.** The previous entry (below) attributed the incorrect gradients to
+- **Corrected the v0.1.3 MPS root cause.** The 0.1.3 entry below attributed the incorrect gradients to
   `torch.abs()` backward on complex tensors. That path does not execute in the default configuration: the
   default splits into real and imaginary parts before calling `torch.abs`, so `torch.abs` never receives a
   complex tensor unless `use_regularization=True`. The actual cause is `torch.stft` backward on MPS, which is
@@ -242,7 +240,9 @@ parameter and position for position.
 - **Completed this changelog.** Versions 0.0.1 through 0.0.5 were absent, and 0.1.0 was labelled the initial
   release with the wrong date.
 
-**Test suite rebuilt.** Not shipped in the wheel, so this changes nothing for users, but it is the reason to
+### Test suite
+
+Rebuilt. Not shipped in the wheel, so this changes nothing for users, but it is the reason to
 trust the corrections above. 112 of the previous 127 test cases compared a wrapper against the function it
 wraps, which is structurally `f(x) == f(x)` and cannot fail for any implementation. Stubbing all four
 `forward` methods to a constant left 122 of 127 passing, and a byte-exact revert of the v0.1.2 bugfix left
@@ -254,7 +254,7 @@ test that exercises a `forward` must fail when it returns a constant) and a cove
 v0.1.2 fix now breaks 50 tests. The MPS tests were rewritten to use an input size where the underlying
 PyTorch bug actually manifests; the previous ones compared CPU against CPU and would have passed regardless.
 
-**Packaging.**
+### Packaging
 
 - Removed `numpy` from the dependencies. It was declared and documented but never imported.
 - Added `py.typed` so type hints reach downstream checkers, and corrected `Optional[dict]` annotations.
@@ -264,6 +264,7 @@ PyTorch bug actually manifests; the previous ones compared CPU against CPU and w
 - Corrected `python_requires` and the version classifiers to a tested floor.
 - CI now runs on pull requests and pushes to `main`, not only on release tags, and the release workflow
   fails if the tag does not match `__version__`.
+
 
 ## 0.1.3 (2026-02-24)
 
@@ -283,9 +284,9 @@ producing correct gradients. The scalar loss is moved back to MPS for the optimi
 - **Time-domain losses** (`L1SNRLoss`, `L1SNRDBLoss`): Unaffected, they never had this issue.
 - Set `mps_cpu_fallback=False` to disable the workaround if a future PyTorch release fixes the MPS bug.
 
-> **Note added in 0.1.4:** this entry originally attributed the bug to `torch.abs()` backward on complex
+> **Note added in 0.2.0:** this entry originally attributed the bug to `torch.abs()` backward on complex
 > tensors. That was incorrect; the cause is `torch.stft` backward above an input length of 65,536 samples.
-> See the 0.1.4 entry. The fix itself was effective. The gradient error direction also differs by PyTorch
+> See the 0.2.0 entry. The fix itself was effective. The gradient error direction also differs by PyTorch
 > version: this entry reported inflation, while torch 2.10 shows deflation. The magnitude quoted originally
 > is not reproducible on current versions and has been removed.
 
