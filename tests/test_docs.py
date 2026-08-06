@@ -486,6 +486,38 @@ def test_the_changelog_states_positional_compatibility_as_a_guarantee():
         "are identical to 0.1.3's")
 
 
+def test_the_readme_documents_the_three_inherent_properties():
+    """Three behaviours a user can hit that no amount of reading the previous text would predict.
+
+    Each is gated behaviourally in test_edge_cases as well; this checks the user-facing half exists, because a
+    property that is true, tested, and undocumented still surprises the person it happens to. Requirements
+    rather than sentences: the Limitations section must name the quantity and give the reader a number.
+    """
+    limits = README[README.index("## Limitations"):README.index("## Contributing")]
+    for topic, needles in [
+        ("the non-monotone spectrogram loss", ["monotone", "-22.4", "DC offset"]),
+        ("the float32 dbrms overflow", ["overflow", "2.5e16", "float64"]),
+        ("no regularizer gradient at silence", ["digital silence", "exactly zero"]),
+    ]:
+        missing = [n for n in needles if n not in limits]
+        assert not missing, f"the Limitations section does not document {topic}; missing {missing}"
+    """`nan_to_num(nan=0.0, posinf=1.0, neginf=-1.0)` zeroes NaN and clamps infinities to full scale.
+
+    Two docstrings, the RuntimeWarning a user reads, and the CHANGELOG all described this as "replaced with
+    zeros". Full-scale audio is the opposite of silence, so someone debugging a level-matching regularizer
+    after an Inf appeared would be looking for the wrong artifact entirely.
+    """
+    for where, doc in [("README", README), ("CHANGELOG", CHANGELOG), ("l1snr.py", SOURCE)]:
+        for claim in ("replaced with zeros", "replacing it with zeros", "them with zeros"):
+            assert claim not in doc, (
+                f"{where} says non-finite input is {claim!r}; only NaN becomes zero, while +/-Inf becomes "
+                "+/-1.0, which is full scale")
+    assert "posinf=1.0" in SOURCE, "this gate assumes the source clamps infinities to full scale"
+    for where, doc in [("CHANGELOG", CHANGELOG), ("l1snr.py", SOURCE)]:
+        assert "1.0" in doc and ("full scale" in doc or "full-scale" in doc), (
+            f"{where} must say what Inf actually becomes, not only what NaN becomes")
+
+
 def test_no_superseded_figures_survive_in_the_documentation():
     """Specific numbers that measurement retired. Each was published, then shown wrong.
 

@@ -74,6 +74,64 @@ def _validate_matching_shapes(estimates, actuals):
         )
 
 
+def _validate_input_tensors(estimates, actuals):
+    """Reject input shapes and dtypes that reshape() would turn into a plausible wrong number.
+
+    Three separate silent failures, all found by feeding the losses input a training loop really produces:
+
+    - **Rank 1.** `reshape(shape[0], -1)` reads a `[T]` waveform as T batch rows of one sample each, so the
+      result is a mean of per-sample D1s. Measured 0.16 to 1.9 dB optimistic across relative errors from 0.5
+      to 0.001, always in the flattering direction and always in a believable dB range.
+    - **A zero-size non-batch dimension.** `torch.mean` over an empty reduction is NaN, and `[B, 0, T]` -- an
+      empty stem selection -- gave NaN from the time-domain classes and 0.0 from the spectrogram one. An
+      empty *batch* already raised, so the inconsistency was the tell.
+    - **Integer dtype.** int16 PCM without `.float()` made `torch.stft` raise for every resolution; the
+      per-resolution handler swallowed it and the spectral loss became a permanent 0.0 after one warning.
+      The time-domain classes raised on the same input, so the classes disagreed.
+    """
+    for name, t in (("estimates", estimates), ("actuals", actuals)):
+        if t.ndim < 2:
+            raise ValueError(
+                f"{name} must be batch-first with at least 2 dimensions, got shape {tuple(t.shape)}. A bare "
+                f"[time] tensor is read as {t.shape[0] if t.ndim else 0} batch rows of one sample each and "
+                "returns an optimistic number rather than an error; add a batch dimension."
+            )
+        if t.numel() == 0:
+            raise ValueError(
+                f"{name} is empty (shape {tuple(t.shape)}); a reduction over no elements is NaN"
+            )
+        if not t.is_floating_point():
+            raise ValueError(
+                f"{name} must be a floating-point tensor, got {t.dtype}. Integer PCM needs an explicit "
+                "conversion, e.g. estimates.float() / 32768.0"
+            )
+
+
+def _validate_non_negative(name, value):
+    """Reject a negative or non-finite coefficient.
+
+    `spec_weight` is confined to [0, 1] precisely because a negative coefficient instructs the optimizer to
+    maximize the error it multiplies. The same argument applies to every other coefficient and none of them
+    were checked: `weight=-1.0` negated the whole objective, and `spec_reg_coef=-5.0` turned the anti-collapse
+    regularizer into a reward for collapsing. Zero stays legal -- it is how a term is switched off.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a non-negative number, got {value!r}")
+    if not (value >= 0.0) or not math.isfinite(value):
+        raise ValueError(
+            f"{name} must be non-negative and finite, got {value}. A negative coefficient instructs the "
+            "optimizer to maximize the quantity it scales."
+        )
+
+
+def _validate_positive(name, value):
+    """Reject a non-positive or non-finite stability constant. Zero defeats the purpose of an epsilon."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a positive number, got {value!r}")
+    if not (value > 0.0) or not math.isfinite(value):
+        raise ValueError(f"{name} must be positive and finite, got {value}")
+
+
 def _validate_unit_range(name, value):
     """Reject a weight outside [0, 1] with a ValueError.
 
@@ -87,6 +145,32 @@ def _validate_unit_range(name, value):
 
 
 def _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn):
+    # Only list lengths, win_length <= n_fft and window_fn were checked. Everything else surfaced late and
+    # confusingly, or not at all: hop_lengths=[0] constructed fine and then raised ZeroDivisionError from
+    # _usable_resolutions on the first forward, mid-training; a bare n_ffts=512 gave "object of type 'int'
+    # has no len()"; a float from YAML died inside hann_window; a negative hop silently dropped its
+    # resolution while the warning claimed the input was too short; and three empty lists were accepted,
+    # making the spectrogram branch a permanent time-domain fallback that reported the same wrong reason.
+    for name, seq in (("n_ffts", n_ffts), ("hop_lengths", hop_lengths), ("win_lengths", win_lengths)):
+        if isinstance(seq, (str, bytes)) or not isinstance(seq, (list, tuple)):
+            raise ValueError(
+                f"{name} must be a list or tuple of ints, got {seq!r}. A single resolution still needs a "
+                f"list, e.g. {name}=[{seq!r}]." if isinstance(seq, int) and not isinstance(seq, bool)
+                else f"{name} must be a list or tuple of ints, got {seq!r}"
+            )
+        if len(seq) == 0:
+            raise ValueError(
+                f"{name} is empty, which leaves no STFT resolution to compute and makes the spectrogram "
+                "loss a permanent time-domain fallback"
+            )
+        for value in seq:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"every entry of {name} must be an int, got {value!r}. A float here fails later inside "
+                    "the window function; config files are the usual source."
+                )
+            if value <= 0:
+                raise ValueError(f"every entry of {name} must be positive, got {value}")
     if not (len(n_ffts) == len(hop_lengths) == len(win_lengths)):
         raise ValueError(
             f"n_ffts, hop_lengths and win_lengths must all have the same length, got "
@@ -180,6 +264,7 @@ class L1SNRLoss(torch.nn.Module):
         _validate_ref_level(ref_level)
         self.ref_level = ref_level
         self.name = name
+        _validate_non_negative("weight", weight)
         self.weight = weight
         self.eps = eps
         self._l1_weight = l1_weight
@@ -200,6 +285,7 @@ class L1SNRLoss(torch.nn.Module):
 
     def forward(self, estimates, actuals, *args, **kwargs):
         _validate_matching_shapes(estimates, actuals)
+        _validate_input_tensors(estimates, actuals)
         batch_size = estimates.shape[0]
 
         est_source = estimates.reshape(batch_size, -1)
@@ -315,7 +401,13 @@ class L1SNRDBLoss(torch.nn.Module):
         _validate_ref_level(ref_level)
         self.ref_level = ref_level
         self.name = name
+        _validate_non_negative("weight", weight)
         self.weight = weight
+        _validate_non_negative("reg_coef", reg_coef)
+        _validate_non_negative("lambda0", lambda0)
+        _validate_non_negative("delta_lambda", delta_lambda)
+        _validate_positive("l1snr_eps", l1snr_eps)
+        _validate_positive("dbrms_eps", dbrms_eps)
         self.reg_coef = reg_coef
         self.lambda0 = lambda0          # minimum regularization weight
         self.delta_lambda = delta_lambda # range of extra weight
@@ -386,6 +478,7 @@ class L1SNRDBLoss(torch.nn.Module):
 
     def forward(self, estimates, actuals, *args, **kwargs):
         _validate_matching_shapes(estimates, actuals)
+        _validate_input_tensors(estimates, actuals)
         batch_size = estimates.shape[0]
 
         est_source = estimates.reshape(batch_size, -1)
@@ -510,7 +603,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             roughly 20 points of knob position at l1_weight=0.5. The spectrogram knob is 2-3x more
             sensitive to this than the time-domain one.
         check_finite (bool): When True (default), scan the inputs for NaN and Inf each call and
-            replace them with zeros, warning once. Costs four full-tensor scans whose results are
+            sanitize them, warning once: NaN becomes 0.0 and +/-Inf becomes +/-1.0, which is full-scale
+            audio rather than silence. Costs four full-tensor scans whose results are
             consumed by a Python `if`, which on CUDA forces a host-device synchronization and
             serializes the pipeline. Measured at roughly 3 ms of a 344 ms CPU forward on
             [8, 2, 264600]. Set False once you trust your data pipeline to be finite; the loss will
@@ -553,6 +647,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             spec_ref_level if spec_ref_level is not None else _STFT_REF_RATIO * ref_level
         )
         self.name = name
+        _validate_non_negative("weight", weight)
         self.weight = weight
         self.min_audio_length = min_audio_length
 
@@ -625,9 +720,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             self.spectrogram_transforms.append(transform)
 
         # Parameters for spectrogram domain level-matching
+        _validate_non_negative("lambda0", lambda0)
+        _validate_non_negative("delta_lambda", delta_lambda)
         self.lambda0 = lambda0
         self.delta_lambda = delta_lambda
         self.lmin = lmin
+        _validate_positive("dbrms_eps", dbrms_eps)
+        _validate_positive("l1snr_eps", l1snr_eps)
         self.dbrms_eps = dbrms_eps
         self.l1snr_eps = l1snr_eps
 
@@ -643,6 +742,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # Add this parameter to control regularization
         self.use_regularization = use_regularization
         # Coefficient to scale spectral regularization (disabled by default)
+        _validate_non_negative("spec_reg_coef", spec_reg_coef)
         self.spec_reg_coef = spec_reg_coef
 
         # Fallback time-domain loss (used when audio is too short for TF processing)
@@ -797,6 +897,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
     def forward(self, estimates, actuals, *args, **kwargs):
         _validate_matching_shapes(estimates, actuals)
+        _validate_input_tensors(estimates, actuals)
         device = estimates.device
         batch_size = estimates.shape[0]
 
@@ -808,8 +909,9 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         ):
             if not self._nan_warned:
                 warnings.warn(
-                    f"{self.name}: non-finite values (NaN or Inf) found in the loss input and replaced "
-                    "with zeros. The loss and its gradient are computed on the sanitized tensors, so a "
+                    f"{self.name}: non-finite values found in the loss input and sanitized (NaN to 0.0, "
+                    "+/-Inf to +/-1.0, i.e. full scale). The loss and its gradient are computed on the "
+                    "sanitized tensors, so a "
                     "diverging model can produce a healthy-looking zero loss. This warning is issued once "
                     "per loss instance; check your model and data if it appears.",
                     RuntimeWarning,
@@ -844,9 +946,22 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             # term. Inside MultiL1SNRDBLoss it also makes both branches the same quantity, so the user is
             # optimizing one domain at effective weight 1.0 while believing otherwise. Say so once.
             if not self._fallback_warned:
+                # Name the constraint that actually bit. This branch is reached either because the input is
+                # below min_audio_length or because no configured resolution fits it, and those want different
+                # fixes. It used to report the min_audio_length text unconditionally, so 1024 samples with
+                # n_ffts=[2048, 4096] read "input length 1024 is below min_audio_length (512)" -- pointing at
+                # a threshold the input clears, and at the wrong knob. Its neighbour case emits a correct
+                # dropped-resolutions message, which made the wrong one look authoritative.
+                if audio_length < self.min_audio_length:
+                    cause = (f"input length {audio_length} is below min_audio_length "
+                             f"({self.min_audio_length})")
+                else:
+                    need = min(self._min_lengths)
+                    cause = (f"input length {audio_length} fits none of the configured resolutions "
+                             f"(n_ffts={list(self.n_ffts)} need at least {need} samples); "
+                             "min_audio_length is not the constraint here")
                 warnings.warn(
-                    f"{self.name}: input length {audio_length} is below min_audio_length "
-                    f"({self.min_audio_length}), so the spectrogram loss is falling back to a time-domain "
+                    f"{self.name}: {cause}, so the spectrogram loss is falling back to a time-domain "
                     "computation. This is a different objective, roughly 2x smaller in magnitude, and "
                     "inside MultiL1SNRDBLoss it makes the time and spectral branches identical. Warned "
                     "once per loss instance.",
@@ -962,12 +1077,20 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             self._allfailed_warned = True
             warnings.warn(
                 f"{self.name}: every spectrogram resolution failed, so the spectral loss is zero and "
-                "carries no learning signal. Check n_ffts against your input length.",
+                "carries no learning signal. Check n_ffts against your input length, that both inputs are "
+                "finite, and that they are on the same device as this module's window buffers.",
                 RuntimeWarning,
                 stacklevel=2,
             )
         if valid_transforms == 0:
-            return (est_source.sum() * 0.0).to(device) * self.weight
+            # Sum BOTH inputs, not just the estimate. Multiplying a sum by 0.0 propagates non-finiteness
+            # (nan * 0 and inf * 0 are both nan), which is what makes this zero honest under
+            # check_finite=False -- but only for whichever tensor is in the expression. With est_source
+            # alone, a NaN in the *target* left every resolution NaN, dropped them all, and returned a clean
+            # -0.0 with a zero gradient: a corrupt target read as a perfectly healthy step. The estimate's
+            # sum still supplies the graph connection; the target's contributes only its finiteness.
+            zero = (est_source.sum() + act_source.sum().detach()) * 0.0
+            return zero.to(device) * self.weight
 
         # Average losses across valid transforms
         avg_spec_loss = total_spec_loss / valid_transforms
@@ -1060,7 +1183,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         mps_cpu_fallback (bool): When True (default), routes the spectrogram branch's STFT through
             CPU on MPS devices to work around incorrect torch.stft backward gradients.
         check_finite (bool): Passed to the spectrogram branch. When True (default), its inputs are
-            scanned for NaN and Inf each call and replaced with zeros, warning once. See
+            scanned for NaN and Inf each call and sanitized, warning once: NaN to 0.0 and +/-Inf to
+            +/-1.0. See
             STFTL1SNRDBLoss for the cost and for why False is defensible.
         time_loss_params (dict): Optional additional parameters to pass to time domain loss.
             Overrides any of the above for the time-domain component only.
@@ -1133,6 +1257,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         self.ref_level = ref_level
         self.spec_ref_level = spec_ref_level
         self.name = name
+        _validate_non_negative("weight", weight)
         self.weight = weight
         self.spec_weight = spec_weight
 
@@ -1219,6 +1344,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             Combined weighted loss from time and spectrogram domains
         """
         _validate_matching_shapes(estimates, actuals)
+        _validate_input_tensors(estimates, actuals)
         # Compute time domain loss
         time_loss = self.time_loss(estimates, actuals, *args, **kwargs)
 

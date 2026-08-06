@@ -344,11 +344,20 @@ def test_batch_of_one_works(cls):
     assert torch.allclose(got, expected(cls, est, act), atol=1e-5)
 
 
+@pytest.mark.parametrize("shape", [(0, 4096), (2, 0), (2, 1, 0), (2, 0, 4096)],
+                         ids=["empty-batch", "empty-time", "empty-trailing", "empty-stem"])
 @pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
-def test_empty_batch_raises(cls):
-    """M18: B=0 raises a cryptic reshape error. Raising is right; the message is not actionable."""
-    with pytest.raises(RuntimeError):
-        cls(name="t")(torch.zeros(0, 4096), torch.zeros(0, 4096))
+def test_empty_input_raises_actionably(cls, shape):
+    """M18 established that empty input should raise; only an empty *batch* did.
+
+    A zero-size non-batch dimension slipped through to `torch.mean` over an empty reduction, which is NaN --
+    and `[B, 0, T]`, an empty stem selection, gave NaN from the time-domain classes but 0.0 from the
+    spectrogram one. The empty batch did raise, but with a cryptic reshape RuntimeError this test's earlier
+    version accepted while noting the message was not actionable. Both halves are fixed: every empty shape
+    raises the same way, and the message names the offending tensor and its shape.
+    """
+    with pytest.raises(ValueError, match="empty"):
+        cls(name="t")(torch.zeros(*shape), torch.zeros(*shape))
 
 
 @pytest.mark.parametrize("length", [4095, 4097, 999])
@@ -1398,6 +1407,287 @@ def test_no_cached_device_state_on_the_loss():
         assert not cached, (
             f"{cls.__name__} caches device state in {cached}; nn.Module.to() cannot update a plain "
             "attribute, so such a cache goes stale and the forward acts on a stale belief")
+
+
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_a_rank_1_waveform_raises_instead_of_returning_an_optimistic_number(cls):
+    """`reshape(shape[0], -1)` read a [T] waveform as T batch rows of one sample each.
+
+    The time-domain classes returned a mean of per-sample D1s: measured 0.16 to 1.9 dB optimistic across
+    relative errors from 0.5 to 0.001, always flattering and always in a believable dB range, with no warning.
+    The spectrogram classes raised a reshape error, so the four classes disagreed on the same input.
+    """
+    sig = torch.randn(16000) * 0.05
+    est = sig + 0.0005 * torch.randn(16000)
+    with pytest.raises(ValueError, match="batch-first"):
+        cls(name="t")(est, sig)
+    # the same data with a batch axis must work, and must not equal the old flattened answer
+    batched = cls(name="t")(est[None], sig[None])
+    assert torch.isfinite(batched)
+
+
+@pytest.mark.parametrize("dtype", [torch.int16, torch.int32, torch.int64, torch.uint8, torch.complex64])
+@pytest.mark.parametrize("cls", ALL_CLASSES, ids=lambda c: c.__name__)
+def test_non_floating_input_raises_instead_of_a_silent_zero(cls, dtype):
+    """int16 PCM straight from a decoder made `STFTL1SNRDBLoss` return -0.0 forever.
+
+    `torch.stft` raises on an integer tensor, the per-resolution handler swallowed it, all resolutions failed,
+    and the spectral loss became a permanent 0.0 after a single warning that Python's default filter shows
+    once. The time-domain classes raised on the same input, so this was also a four-way inconsistency.
+    """
+    if dtype.is_complex:
+        t = torch.randn(2, 1, 4096, dtype=dtype)
+    else:
+        t = torch.randint(0, 99, (2, 1, 4096), dtype=dtype)
+    with pytest.raises(ValueError, match="floating-point"):
+        cls(name="t")(t, t.clone())
+
+
+@pytest.mark.no_forward  # constructor validation; never reaches a forward
+@pytest.mark.parametrize("param", ["weight", "lambda0", "delta_lambda", "spec_reg_coef"])
+def test_a_negative_coefficient_raises(param):
+    """`spec_weight` is confined to [0, 1] because a negative coefficient maximizes what it scales.
+
+    Nothing else was checked. `weight=-1.0` negated the entire objective and `spec_reg_coef=-5.0` turned the
+    anti-collapse regularizer into a reward for collapsing, both silently. Zero stays legal: it is how a term
+    is switched off.
+    """
+    with pytest.raises(ValueError, match="non-negative"):
+        MultiL1SNRDBLoss(name="m", **{param: -1.0})
+    MultiL1SNRDBLoss(name="m", **{param: 0.0})  # zero must remain accepted
+
+
+@pytest.mark.no_forward  # constructor validation; never reaches a forward
+@pytest.mark.parametrize("param", ["l1snr_eps", "dbrms_eps"])
+def test_a_non_positive_epsilon_raises(param):
+    """An epsilon of zero or below defeats the stability it exists for; neither was checked."""
+    for bad in (0.0, -1e-3):
+        with pytest.raises(ValueError, match="positive"):
+            MultiL1SNRDBLoss(name="m", **{param: bad})
+
+
+@pytest.mark.no_forward  # constructor validation; never reaches a forward
+@pytest.mark.parametrize("kwargs,match", [
+    ({"hop_lengths": [0, 512, 256]}, "positive"),
+    ({"hop_lengths": [-128, 512, 256]}, "positive"),
+    ({"n_ffts": 512}, "list or tuple"),
+    ({"n_ffts": [512.0], "hop_lengths": [128], "win_lengths": [512]}, "must be an int"),
+    ({"n_ffts": [], "hop_lengths": [], "win_lengths": []}, "empty"),
+])
+def test_malformed_stft_params_raise_at_construction(kwargs, match):
+    """These failed late, confusingly, or not at all.
+
+    `hop_lengths=[0]` constructed fine and then raised ZeroDivisionError from `_usable_resolutions` on the
+    first forward, mid-training, with no mention of hop_length. A bare `n_ffts=512` gave "object of type 'int'
+    has no len()". A float from a YAML config died inside `hann_window`. A negative hop silently dropped its
+    resolution while the warning claimed the input was too short. Three empty lists were accepted outright,
+    making the spectrogram branch a permanent time-domain fallback reporting that same wrong reason.
+    """
+    with pytest.raises(ValueError, match=match):
+        STFTL1SNRDBLoss(name="s", **kwargs)
+
+
+def test_a_single_resolution_in_a_list_is_still_valid():
+    """The bare-int rejection must not catch the legitimate one-resolution case."""
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    loss = STFTL1SNRDBLoss(name="s", n_ffts=[1024], hop_lengths=[256], win_lengths=[1024])
+    out = loss(est, act)
+    want = reference.multi_res_spec_d1(est, act, n_ffts=[1024], hop_lengths=[256], win_lengths=[1024])
+    assert torch.allclose(out, want, atol=1e-4), (
+        f"a single-resolution configuration returns {out.item()} against the reference's {want.item()}")
+
+
+def test_the_spectrogram_loss_is_not_monotone_and_the_docs_say_so():
+    """Pins the inversion itself, so the documented claim cannot quietly stop being true.
+
+    A DC offset produces almost no imaginary error, so `D1_im` saturates at the eps floor and pays a fixed
+    reward any near-purely-real error collects. The result is an estimate the time domain rates ~10 dB worse
+    scoring ~5 dB better on the spectrogram loss. This is a property of the published Re+Im objective --
+    confirmed against tests/reference.py -- so the gate exists to keep the documentation honest, not to
+    forbid the behaviour. If a future change makes the loss monotone here, this test should fail and the
+    README's Limitations entry should come out with it.
+    """
+    torch.manual_seed(7)
+    act = torch.randn(4, 2, 44100) * 0.05
+    dc = act + torch.full_like(act, 0.05)          # error equal to the signal amplitude
+    noise = act + 0.005 * torch.randn_like(act)    # 10% relative error
+
+    time_dc = L1SNRLoss("t")(dc, act).item()
+    time_noise = L1SNRLoss("t")(noise, act).item()
+    spec_dc = STFTL1SNRDBLoss("s")(dc, act).item()
+    spec_noise = STFTL1SNRDBLoss("s")(noise, act).item()
+
+    assert time_dc > time_noise, "the time domain should rate the DC error worse; the fixture has drifted"
+    assert spec_dc < spec_noise, (
+        f"the spectrogram loss no longer inverts the ordering (DC {spec_dc:.2f} vs noise {spec_noise:.2f}); "
+        "if this is deliberate, remove the Limitations entry that documents it")
+    # and the combined default must still order them correctly, which is why it is the recommended entry point
+    multi_dc = MultiL1SNRDBLoss("m")(dc, act).item()
+    multi_noise = MultiL1SNRDBLoss("m")(noise, act).item()
+    assert multi_dc > multi_noise, (
+        "MultiL1SNRDBLoss at spec_weight=0.5 no longer orders these correctly, which the README relies on")
+
+
+def test_the_regularizer_has_no_gradient_at_exact_silence_but_the_loss_does():
+    """Two halves, because only stating the first would read as "the model gets stuck", which it does not.
+
+    `d/dx sqrt(mean(x^2) + eps)` is exactly 0 at `x == 0`, so the anti-collapse term exerts no force at the
+    collapse point itself. The D1 term does, so the total gradient is nonzero and a saturated mask can still
+    escape.
+    """
+    x = torch.zeros(2, 16000, requires_grad=True)
+    torch.sqrt(torch.mean(x ** 2, dim=-1) + 1e-8).sum().backward()
+    assert x.grad.abs().max().item() == 0.0, (
+        "the RMS term's gradient at exact zero is no longer zero; the documented caveat is stale")
+
+    est = torch.zeros(2, 16000, requires_grad=True)
+    act = audio(2, 16000)
+    out = MultiL1SNRDBLoss("m", use_time_regularization=True)(est, act)
+    out.backward()
+    assert est.grad.abs().max().item() > 0.0, (
+        "the total gradient at exact silence is zero, so a collapsed model really would be stuck; the "
+        "README says the D1 term supplies escape pressure")
+
+
+@pytest.mark.no_forward  # exercises dbrms directly, not a loss forward
+def test_dbrms_overflows_float32_on_finite_input_and_float64_does_not():
+    """`mean(x**2)` squares before reducing, so the sum overflows around 2.5e16 at a realistic shape.
+
+    The inputs are finite, so `check_finite` cannot catch it. Left as documented behaviour rather than
+    re-tuned, because it needs a run already diverging through 1e16 and inf/NaN is loud. Gated so the README's
+    figure stays attached to something measured, and so a future numerics change has to notice this claim.
+    """
+    # 529200 elements per row: a [8, 2, 264600] batch flattened as dbrms flattens it. The threshold scales
+    # with elements per row (2.0e17 at 8192, 2.5e16 here), so the shape is load-bearing.
+    x32 = torch.full((8, 2 * 264600), 3e16, dtype=torch.float32)
+    assert not torch.isfinite(dbrms(x32)).all(), (
+        "dbrms no longer overflows at 3e16 in float32; if the numerics were made overflow-safe, update the "
+        "README's Limitations entry")
+    assert torch.isfinite(x32).all(), "the premise is that the input itself is finite"
+    x64 = torch.full((8, 2 * 264600), 3e16, dtype=torch.float64)
+    assert torch.isfinite(dbrms(x64)).all(), "float64 is documented as unaffected"
+
+
+def test_the_fallback_warning_names_the_constraint_that_actually_bit():
+    """The fallback branch has two causes and used to report only one of them.
+
+    1024 samples with `n_ffts=[2048, 4096]` and `min_audio_length=512` warned "input length 1024 is below
+    min_audio_length (512)" -- a threshold the input clears, naming a knob that would not help. The real
+    constraint is the per-resolution `n_fft // 2 + 1` requirement. Two high-resolution FFTs is an ordinary
+    choice, and the neighbouring case emits a correct dropped-resolutions message, which made the wrong one
+    look authoritative. Same defect class as the all-resolutions-failed warning fixed earlier in this branch.
+    """
+    loss = STFTL1SNRDBLoss("spec", n_ffts=[2048, 4096], hop_lengths=[512, 1024],
+                           win_lengths=[2048, 4096], min_audio_length=512)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        loss(audio(2, 1024), audio(2, 1024, seed=1))
+    msg = str(caught[0].message)
+    assert "is below min_audio_length" not in msg, (
+        f"the warning claims 1024 is below min_audio_length=512, which it is not: {msg}")
+    assert "1025" in msg, "the warning should state the length the configured resolutions actually need"
+
+    # the genuinely-too-short case must still name min_audio_length
+    short = STFTL1SNRDBLoss("spec", min_audio_length=512)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        short(audio(2, 400), audio(2, 400, seed=1))
+    assert "below min_audio_length" in str(caught[0].message), (
+        "an input that really is below the threshold must still say so")
+
+
+def test_check_finite_substitutes_full_scale_for_inf_not_zero():
+    """Two docstrings, the runtime warning and the CHANGELOG all said "replaced with zeros".
+
+    Only NaN becomes zero. `torch.nan_to_num(posinf=1.0, neginf=-1.0)` maps infinities to full-scale audio, so
+    a corrupt Inf sample becomes the loudest possible click rather than silence -- a materially different
+    thing to see when a level-matching regularizer starts moving. The substitution values had no test at all,
+    so the docs could drift from them freely.
+    """
+    est = torch.zeros(1, 4096)
+    est[0, 0] = float("inf")
+    est[0, 1] = float("-inf")
+    est[0, 2] = float("nan")
+    act = torch.zeros(1, 4096)
+    loss = STFTL1SNRDBLoss("spec", check_finite=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        got = loss(est, act)
+    # what the loss would be if Inf really were zeroed: an all-silent estimate against a silent target
+    zeroed = loss(torch.zeros(1, 4096), act)
+    assert got.item() != zeroed.item(), (
+        "sanitizing Inf to zero and to full scale gave the same loss, so this test cannot see the difference")
+    sanitized = torch.nan_to_num(est, nan=0.0, posinf=1.0, neginf=-1.0)
+    assert sanitized[0, 0].item() == 1.0 and sanitized[0, 1].item() == -1.0, (
+        "the documented substitution no longer matches torch.nan_to_num's arguments in the source")
+    assert torch.allclose(loss(sanitized, act), got), (
+        "the loss does not match one computed on the substitution the docs now describe")
+
+
+@pytest.mark.parametrize("corrupt", ["estimates", "actuals"])
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_check_finite_false_propagates_non_finite_from_either_input(corrupt, bad):
+    """With check_finite=False a non-finite input must reach the loss, whichever tensor it is in.
+
+    It did not. Every resolution went NaN, the isnan guard dropped them all, and the all-failed fallback was
+    `est_source.sum() * 0.0` -- an expression that carries non-finiteness only from the estimate. A NaN in the
+    *target* therefore produced exactly -0.0 with an all-zero gradient: a corrupt target reading as a
+    perfectly healthy step, which is the same silent-zero failure as the cached-device bug and the detached
+    zero before it. Both the README and the CHANGELOG recommend check_finite=False on CUDA, and a non-finite
+    target is the ordinary corrupt-decode case, so this is the combination a user actually reaches.
+    """
+    torch.manual_seed(3)
+    est = (torch.randn(2, 1, 8192) * 0.05).requires_grad_(True)
+    act = est.detach() + 0.005 * torch.randn(2, 1, 8192)
+    if corrupt == "actuals":
+        act[0, 0, 100] = bad
+    else:
+        est.data[0, 0, 100] = bad
+    loss = STFTL1SNRDBLoss("spec", check_finite=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = loss(est, act)
+    assert not torch.isfinite(out), (
+        f"a {bad} in {corrupt} produced the finite loss {out.item()!r} with check_finite=False, which "
+        "documents itself as letting non-finite values propagate visibly")
+    # Anchor the clean path to a reference number. Without this the `corrupt="estimates"` variants pass
+    # against a stubbed forward, because a stub that touches `estimates` propagates NaN on its own -- so they
+    # would be asserting a property of NaN arithmetic rather than of this library.
+    clean_est = (torch.randn(2, 1, 8192) * 0.05)
+    clean_act = clean_est + 0.005 * torch.randn(2, 1, 8192)
+    clean = loss(clean_est, clean_act)
+    assert torch.allclose(clean, expected(STFTL1SNRDBLoss, clean_est, clean_act), atol=1e-4), (
+        "finite input no longer matches the independent reference")
+
+
+def test_the_all_failed_fallback_is_still_a_graph_connected_zero():
+    """The fix for the above must not cost the property the fallback exists for.
+
+    When every resolution legitimately fails on finite input the return has to be zero, attached to the
+    graph, and differentiable, or .backward() raises and the term silently contributes nothing inside
+    MultiL1SNRDBLoss while the time term goes on training.
+    """
+    est = (torch.randn(2, 1, 4096) * 0.05).requires_grad_(True)
+    act = est.detach() + 0.001
+    loss = STFTL1SNRDBLoss("spec")
+
+    class _AlwaysFails(torch.nn.Module):
+        def forward(self, _x):
+            raise RuntimeError("forced failure")
+
+    # Reaching this branch with finite input on CPU takes a forced failure: _usable_resolutions admits only
+    # resolutions torch.stft actually accepts, so every natural route to it involves a non-finite value or a
+    # device mismatch, and MPS is not available everywhere this suite runs.
+    loss.spectrogram_transforms = torch.nn.ModuleList([_AlwaysFails() for _ in loss.n_ffts])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        out = loss(est, act)
+    out.backward()
+    assert out.item() == 0.0, f"the fallback must be zero on finite input, got {out.item()!r}"
+    assert out.grad_fn is not None, "the fallback must stay attached to the graph"
+    assert est.grad is not None and torch.isfinite(est.grad).all(), (
+        "the fallback must be differentiable, or .backward() raises and the spectral term silently "
+        "contributes nothing inside MultiL1SNRDBLoss")
 
 
 @pytest.mark.no_forward  # inspects signatures only

@@ -94,6 +94,27 @@ not expect. Load with `strict=False`, or filter those keys out first.
   `(2, 4, 8000)` against `(2, 2, 16000)` returned a plausible number from a wrong pairing.
 - An unrecognized `window_fn`, which previously surfaced as an `AttributeError` about a mangled attribute name.
 - A non-positive `ref_level`.
+- **Input with fewer than 2 dimensions.** A bare `[time]` tensor was read as T batch rows of one sample
+  each, returning a mean of per-sample D1s: measured 0.16 to 1.9 dB optimistic across relative errors from
+  0.5 to 0.001, always in the flattering direction and always in a believable dB range.
+- **Input with any zero-size dimension.** An empty batch already raised, with a cryptic reshape error; a
+  zero-size non-batch dimension reached `torch.mean` over an empty reduction and returned NaN, and
+  `[B, 0, T]` -- an empty stem selection -- gave NaN from the time-domain classes but 0.0 from the
+  spectrogram one. All four classes now raise the same `ValueError`, naming the tensor and its shape.
+- **Non-floating-point input.** int16 PCM without an explicit conversion made `torch.stft` raise for every
+  resolution; the per-resolution handler swallowed it and the spectral loss became a permanent 0.0 after one
+  warning. The time-domain classes raised on the same input, so the four disagreed.
+- **A negative `weight`, `lambda0`, `delta_lambda`, `reg_coef` or `spec_reg_coef`, and a non-positive
+  `l1snr_eps` or `dbrms_eps`.** `spec_weight` was confined to [0, 1] precisely because a negative
+  coefficient instructs the optimizer to maximize what it scales; nothing else was checked, so
+  `weight=-1.0` negated the whole objective and `spec_reg_coef=-5.0` turned anti-collapse into a reward for
+  collapsing. Zero remains legal for the coefficients, since that is how a term is switched off.
+- **Malformed STFT parameters:** a non-positive `n_fft`, `hop_length` or `win_length`, a non-list passed
+  where a list of resolutions is expected, a non-int entry, or an empty resolution list. `hop_lengths=[0]`
+  previously constructed without complaint and then raised `ZeroDivisionError` on the first forward,
+  mid-training; a bare `n_ffts=512` gave "object of type 'int' has no len()"; a float from a config file
+  failed inside the window function; and empty lists were accepted, silently making the spectrogram branch a
+  permanent time-domain fallback.
 
 Validation now raises `ValueError` rather than using bare `assert`, which `python -O` strips. Under 0.1.x with
 `-O`, out-of-range values produced a silently wrong loss.
@@ -138,8 +159,16 @@ table above, because the regularizer amplifies a level shift when a level sits n
 `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` gain `check_finite` (default `True`, preserving current behaviour).
 The non-finite input scan costs four full-tensor passes whose results are consumed by a Python `if`, which on
 CUDA forces a host-device synchronization and serializes the pipeline. Setting it `False` saves about 1% of a
-CPU forward and removes those synchronizations; the loss then propagates `NaN` rather than replacing it with
-zeros, which is arguably preferable during training anyway.
+CPU forward and removes those synchronizations; the loss then propagates `NaN` rather than sanitizing it,
+which is arguably preferable during training anyway. With `check_finite=False` a non-finite value in **either**
+input reaches the loss: earlier in this branch a non-finite *target* was silently absorbed and returned a
+clean `-0.0` with a zero gradient, because the all-resolutions-failed fallback carried non-finiteness only
+from the estimate.
+
+Note what the scan substitutes when it is enabled: `NaN` becomes `0.0`, but `±Inf` becomes `±1.0`, which is
+full-scale audio, not silence. A corrupt `Inf` sample is replaced by a full-scale click rather than by
+nothing, which matters when reading a level-matching regularizer's output. The warning and two docstrings
+previously described the substitution as zeroing, and mentioned only the NaN case.
 
 **The spectrogram loss is about 14% faster.** The STFT window normalization is folded into the window itself
 rather than dividing the whole complex output by the same constant on every call. This is mathematically
@@ -190,6 +219,19 @@ Two further optimizations were investigated and did not ship, recorded because t
 ### Documentation corrections
 
 Several documented claims did not match the implementation:
+
+- **Documented three inherent properties an edge-case sweep surfaced.** None is a code change; each is a
+  behaviour a user can hit and could not have predicted from the previous text. `STFTL1SNRDBLoss` alone is
+  **not monotone in reconstruction quality**, because the `eps` floor applies per component: a DC offset
+  produces almost no imaginary error, so `D1_im` saturates and pays a fixed reward. On `[4, 2, 44100]` at
+  amplitude 0.05 a DC offset equal to the signal amplitude scores -22.4 dB where 10% white noise scores
+  -17.6 dB, though the time-domain D1 rates the DC error about 10 dB worse. Confirmed against an independent
+  reference, so it is a property of the published real-plus-imaginary objective and changing it would break
+  D1's bit-exactness with the authors' code. `dbrms` **overflows in float32** once `|x|` reaches about 2.5e16
+  at realistic shapes, because `mean(x**2)` squares before reducing; the inputs stay finite so `check_finite`
+  cannot see it. And the level-matching regularizer has **exactly zero gradient at digital silence**, since
+  `d/dx sqrt(mean(x^2) + eps)` is 0 at 0, so escape pressure at a fully collapsed output comes from the D1
+  term rather than from the regularizer.
 
 - **All README examples now run.** Four of the five runnable examples raised
   `RuntimeError: element 0 of tensors does not require grad` on `loss.backward()`, because the example
