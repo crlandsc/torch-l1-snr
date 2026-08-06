@@ -1349,3 +1349,105 @@ def test_one_shot_warnings_really_fire_only_once(latch, make, call):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         call(loss_fn)                     # a second call must be silent
+
+
+@pytest.mark.parametrize("cls", [STFTL1SNRDBLoss, MultiL1SNRDBLoss], ids=lambda c: c.__name__)
+def test_moving_the_loss_module_does_not_break_a_cpu_forward(cls):
+    """A device guard cached in a plain attribute goes stale under nn.Module.to().
+
+    T4-5 skipped the transform device move when a cached `_transforms_device` matched. `.to()` moves the
+    window buffers but cannot update a Python attribute, so after `loss.to(device)` the cache still said
+    "cpu" while the buffers had moved: the guard skipped a needed move, every resolution failed on a device
+    mismatch, and the spectral loss became exactly 0.0 with a zero gradient. On Apple silicon that is the
+    default path, since mps_cpu_fallback puts the input on CPU while the buffers are on MPS.
+
+    Exercised with meta and CPU here so it runs everywhere. The essential property is that a forward must
+    never depend on a cached belief about where the buffers are.
+    """
+    act = audio(2, 2, 8192)
+    est = (act + audio(2, 2, 8192, level=0.005, seed=1)).requires_grad_(True)
+    expected_value = cls(name="t")(est.detach(), act)
+
+    loss_fn = cls(name="t")
+    # simulate a module move: relocate the buffers without going through forward
+    for tf in (loss_fn.spectrogram_transforms if cls is STFTL1SNRDBLoss
+               else loss_fn.spec_loss.spectrogram_transforms):
+        tf.window.data = tf.window.data.clone()
+    loss_fn.to(torch.device("cpu"))
+
+    got = loss_fn(est, act)
+    assert got.item() != 0.0, (
+        "the loss is exactly zero after a module move, which means the transforms were left on the wrong "
+        "device and every resolution failed")
+    assert torch.allclose(got, expected_value, atol=1e-5)
+    got.backward()
+    assert est.grad.abs().max().item() > 0.0, "a module move must not zero the gradient"
+
+
+@pytest.mark.no_forward  # inspects instance attributes; never calls forward()
+def test_no_cached_device_state_on_the_loss():
+    """Structural guard on the mechanism, not just the symptom.
+
+    The symptom test above cannot reproduce the accelerator case on a CPU-only machine, so this asserts the
+    cause is absent: no attribute caching a device, because such a cache cannot be kept in step with
+    nn.Module.to().
+    """
+    for cls in (STFTL1SNRDBLoss, MultiL1SNRDBLoss):
+        loss_fn = cls(name="t")
+        cached = [a for a in vars(loss_fn) if "device" in a.lower()]
+        assert not cached, (
+            f"{cls.__name__} caches device state in {cached}; nn.Module.to() cannot update a plain "
+            "attribute, so such a cache goes stale and the forward acts on a stale belief")
+
+
+@pytest.mark.no_forward  # inspects signatures only
+def test_new_constructor_params_are_appended_not_inserted():
+    """A parameter inserted mid-signature silently reinterprets every positional call.
+
+    `spec_reg_coef` was added at position 17 of MultiL1SNRDBLoss, before `time_loss_params`. A 17-argument
+    positional call written against 0.1.3 then *constructed and ran without error* while the user's
+    `time_loss_params` dict landed in `spec_reg_coef` and their overrides were silently discarded. This pins
+    the 0.1.3 parameter order as a prefix, so additions have to go at the end.
+    """
+    import inspect as _inspect
+    # the published 0.1.3 order, in full
+    v013 = {
+        "MultiL1SNRDBLoss": ["name", "weight", "spec_weight", "l1_weight", "use_time_regularization",
+                             "use_spec_regularization", "lambda0", "delta_lambda", "l1snr_eps",
+                             "dbrms_eps", "lmin", "n_ffts", "hop_lengths", "win_lengths", "window_fn",
+                             "min_audio_length", "time_loss_params", "spec_loss_params",
+                             "mps_cpu_fallback"],
+        "L1SNRLoss": ["name", "weight", "eps", "l1_weight"],
+        "L1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
+                        "use_regularization", "l1_weight"],
+        "STFTL1SNRDBLoss": ["name", "weight", "lambda0", "delta_lambda", "l1snr_eps", "dbrms_eps", "lmin",
+                            "n_ffts", "hop_lengths", "win_lengths", "window_fn", "min_audio_length",
+                            "use_regularization", "spec_reg_coef", "l1_weight", "mps_cpu_fallback"],
+    }
+    for cls in ALL_CLASSES:
+        current = [p for p in _inspect.signature(cls.__init__).parameters if p != "self"]
+        expected = v013[cls.__name__]
+        assert current[:len(expected)] == expected, (
+            f"{cls.__name__}'s 0.1.3 parameter order is no longer a prefix of its signature. A positional "
+            f"call written against 0.1.3 would now mean something different.\n"
+            f"  0.1.3:   {expected}\n  current: {current[:len(expected)]}")
+
+
+def test_all_resolutions_failed_warning_is_one_shot():
+    """The CHANGELOG lists this among the one-shot warnings, but it had no latch and fired every call,
+    deduped only by Python's default filter. It is also the warning a device-mismatched run emits, so in
+    the case where it matters most it would have repeated every step."""
+    loss_fn = _all_failing_loss()
+    est, act = audio(2, 8192), audio(2, 8192, seed=1)
+    with pytest.warns(RuntimeWarning, match="every spectrogram resolution failed"):
+        first = loss_fn(est, act)
+    assert first.item() == 0.0
+    # Scoped to the warning under test. The per-resolution "Error computing spectrogram" UserWarning is a
+    # separate backstop that reports a genuine exception on every call and is deliberately not latched --
+    # the CHANGELOG lists exactly three one-shot warnings and that is not one of them.
+    with warnings.catch_warnings(record=True) as rec:
+        warnings.simplefilter("always")
+        second = loss_fn(est, act)
+    repeats = [w for w in rec if "every spectrogram resolution failed" in str(w.message)]
+    assert not repeats, f"the all-resolutions-failed warning fired again on call 2: {repeats}"
+    assert second.item() == 0.0, "latching the warning must not change the returned value"

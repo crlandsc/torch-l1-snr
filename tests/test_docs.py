@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -388,9 +389,21 @@ def test_changelog_states_compatibility_per_loss_not_globally():
         assert cls in breaking, f"the compatibility table does not mention {cls}"
     assert "bit-identical" in breaking and "differs" in breaking, (
         "the table must distinguish the losses that are bit-identical from those that are not")
-    assert "compare loss values, not gradients" in breaking, (
-        "the CHANGELOG must tell a validating user to compare loss values; a strict gradient comparison "
-        "fails at realistic shapes even at 10% error and tells them nothing")
+    # Checked as a requirement, not a phrase. Pinning the exact sentence is what made an earlier version of
+    # this gate defend a false claim, and it broke again the moment the wording was improved.
+    # Scoped to the paragraph that gives validation advice. An earlier version searched the whole BREAKING
+    # section and compared positions, which was meaningless: "gradients" appears in the compatibility table
+    # header hundreds of characters before any guidance.
+    paras = [p for p in breaking.split("\n\n") if "validate the upgrade" in p or "diffing" in p]
+    assert paras, "the CHANGELOG does not tell a user how to validate the upgrade"
+    guidance = " ".join(paras).lower()
+    assert "tolerance" in guidance or "rtol" in guidance, (
+        "the validation guidance must name a tolerance; an exact comparison fails on every path")
+    assert "loss values" in guidance and "gradient" in guidance, (
+        "the guidance must mention both, so a user knows which to compare")
+    assert guidance.index("loss values") < guidance.index("gradient"), (
+        "the guidance should reach loss values before gradients, since gradients differ by ~5e-04 relative "
+        "at realistic shapes even at 10% error and a strict comparison tells a user nothing")
 
 
 def test_readme_dbrms_formula_matches_the_code():
@@ -437,3 +450,58 @@ def test_no_superseded_figures_survive_in_the_documentation():
     for text, why in retired.items():
         for where, doc in [("README", README), ("CHANGELOG", CHANGELOG), ("l1snr.py", SOURCE)]:
             assert text not in doc, f"{where} still contains the retired figure {text!r}: {why}"
+
+
+def test_changelog_compatibility_bounds_are_not_exceeded():
+    """The bounds in the compatibility table are a promise a user validates against, so measure them.
+
+    They were first published as 1.1e-07 and 2.2e-07 and are actually up to 4e-05, exceeded worst on a
+    silent estimate against a quiet target -- the collapse case the regularizer exists to detect, and the
+    one a tester is most likely to construct. Driver is the dbrms epsilon removal, amplified by the
+    regularizer's |L_pred - L_true| term when a level sits near the -80 dB floor, so it shows up in float64
+    too and is not a rounding effect.
+    """
+    import re as _re
+    import subprocess as _sub
+    import tempfile as _tmp
+    import importlib.util as _il
+    import torch as _t
+
+    stated = {}
+    for line in CHANGELOG.split("### BREAKING CHANGES")[1].split("### ")[0].splitlines():
+        if line.startswith("|") and "differs, up to" in line:
+            m = _re.search(r"up to \*{0,2}([0-9.e-]+)\*{0,2} relative", line)
+            if m:
+                for cls in ["L1SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]:
+                    if cls in line:
+                        stated.setdefault(cls, float(m.group(1)))
+    assert stated, "no compatibility bounds found in the CHANGELOG table"
+
+    src = _sub.run(["git", "-C", str(REPO), "show", "938b4f1:torch_l1_snr/l1snr.py"],
+                   capture_output=True, text=True, check=True).stdout
+    path = _tmp.mkdtemp() + "/base.py"
+    open(path, "w").write(src)
+    spec = _il.spec_from_file_location("base_bounds", path)
+    base = _il.module_from_spec(spec)
+    spec.loader.exec_module(base)
+
+    import torch_l1_snr.l1snr as cur
+    worst = {}
+    for cls in stated:
+        for dt in (_t.float32, _t.float64):
+            for lvl in (1.0, 0.05, 0.001):
+                for kind in ("noisy", "silent_est"):
+                    g = _t.Generator().manual_seed(0)
+                    a = (_t.randn(2, 2, 4096, generator=g) * lvl).to(dt)
+                    e = (torch.zeros_like(a) if kind == "silent_est"
+                         else a + (_t.randn(2, 2, 4096, generator=g) * lvl * 0.1).to(dt))
+                    vo = getattr(base, cls)(name="t")(e, a)
+                    vn = getattr(cur, cls)(name="t")(e, a)
+                    if vo.item() == 0:
+                        continue
+                    r = abs((vn.item() - vo.item()) / vo.item())
+                    worst[cls] = max(worst.get(cls, 0.0), r)
+    for cls, bound in stated.items():
+        assert worst.get(cls, 0.0) <= bound * 1.5, (
+            f"the CHANGELOG says {cls} differs by up to {bound:.1e} relative; measured "
+            f"{worst[cls]:.2e}, which is {worst[cls] / bound:.0f}x the stated bound")

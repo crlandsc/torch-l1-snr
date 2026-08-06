@@ -12,12 +12,19 @@ Read this section before upgrading.
 |---|---|---|
 | `L1SNRLoss` | bit-identical | bit-identical |
 | `L1SNRDBLoss(use_regularization=False)` | bit-identical | bit-identical |
-| `L1SNRDBLoss(use_regularization=True)` | differs, up to 1.1e-07 relative | differs |
-| `STFTL1SNRDBLoss`, `MultiL1SNRDBLoss` | differs, up to 2.2e-07 relative | differs |
+| `L1SNRDBLoss(use_regularization=True)` | differs, up to **4e-05** relative | differs |
+| `STFTL1SNRDBLoss(use_regularization=False)` | differs, up to 1e-07 relative | differs |
+| `STFTL1SNRDBLoss(use_regularization=True)`, `MultiL1SNRDBLoss` | differs, up to **4e-05** relative | differs |
 
-Two changes cause it: the window-normalization fold, and the `dbrms` epsilon cleanup, both described below.
-Loss values move at float32 rounding, so a comparison to six significant figures will match and one to full
-precision will not.
+Two changes cause it, and they are of different sizes. The window-normalization fold moves values at float32
+rounding, around 1e-07 relative. The `dbrms` epsilon cleanup is larger and is **not** a rounding effect: it
+changes the level of a near-silent signal by up to 8e-04 dB, and the regularizer's `R = |L_pred - L_true|`
+term amplifies that when either level sits near the -80 dB floor. So it appears in float64 as well as
+float32, and the worst case is a **silent estimate against a quiet target**, which is exactly the collapse
+case the regularizer exists to detect and the case you are most likely to construct while testing.
+
+If you pin a loss value in a regression test, expect to update it for any configuration with regularization
+enabled, or for either spectrogram class.
 
 Gradients move considerably more, and by an amount that depends both on how converged your estimate is and
 on how large your tensors are. Relative L2 difference:
@@ -36,9 +43,10 @@ Perturbing 0.1.x's own window by a single floating-point step produces a differe
 this is a property of an L1 objective rather than of this release, and it is far below the gradient noise of
 minibatch training.
 
-**If you are diffing to validate the upgrade, compare loss values, not gradients.** Loss values differ only
-at float32 rounding on every path; gradients differ by ~5e-04 relative at a realistic batch shape even at
-10% error, so a strict gradient comparison will fail and tell you nothing.
+**If you are diffing to validate the upgrade, use a relative tolerance, and prefer loss values to
+gradients.** Loss values differ by at most 4e-05 relative, so `rtol=1e-4` passes on every path. Gradients
+differ by ~5e-04 relative at a realistic batch shape even at 10% error, so a strict gradient comparison will
+fail and tell you nothing useful.
 
 The remaining changes below affect the blended path, previously-accepted invalid input, and checkpoint keys.
 
@@ -48,8 +56,9 @@ The scale was `c * mean_b(1 / (mean|y|_b + eps))`, a mean of reciprocals compute
 measurable problems. One quiet target inflated the scale for the whole batch, so samples at identical relative
 error saw their gradients change because a *different* sample went quiet. How far depends on the batch: 2.1x
 with one quiet row in four at `l1_weight=0.5`, 4.8x with seven quiet rows in eight, and over 30x at
-`l1_weight=0.9` with a loud held row. It is now exactly 1.000x in every case. And the knob's meaning drifted with batch content, with the batch-to-batch spread in how far
-`l1_weight` moves the loss toward L1 reaching 75 percentage points at `l1_weight=0.5`.
+`l1_weight=0.9` with a loud held row. Second, the knob's meaning drifted with batch content: the
+batch-to-batch spread in how far `l1_weight` moves the loss toward L1 reached 75 percentage points at
+`l1_weight=0.5`.
 
 Two new parameters replace it. `ref_level` (default `0.05`) is the typical mean-absolute amplitude of your
 targets; `spec_ref_level` defaults to `0.19 * ref_level`, the measured ratio between the normalized-STFT and
@@ -83,12 +92,20 @@ not expect. Load with `strict=False`, or filter those keys out first.
 Validation now raises `ValueError` rather than using bare `assert`, which `python -O` strips. Under 0.1.x with
 `-O`, out-of-range values produced a silently wrong loss.
 
-**4. `l1_weight` is read-only after construction.**
+**4. `MultiL1SNRDBLoss`'s new constructor parameters are appended, not inserted.**
+
+0.1.4 briefly inserted `spec_reg_coef` at position 17, before `time_loss_params`. A 17-argument *positional*
+call written against 0.1.3 then constructed and ran with no error while the caller's `time_loss_params` dict
+landed in `spec_reg_coef` and their overrides were silently discarded. All parameters added since 0.1.3 now
+follow `mps_cpu_fallback`, so 0.1.3's parameter order is a strict prefix of the current one and positional
+calls keep their meaning. A test pins that order.
+
+**5. `l1_weight` is read-only after construction.**
 
 It is baked into child modules and mode flags when the loss is built, so assigning to it changed the number
 without changing the behaviour it had already determined. Construct a new loss instead.
 
-**5. Short-audio and dtype behaviour changed.**
+**6. Short-audio and dtype behaviour changed.**
 
 - `STFTL1SNRDBLoss(use_regularization=True)` below `min_audio_length` previously dropped the regularizer
   silently. A total collapse then scored exactly `0.000000`, which is the failure the regularizer exists to
@@ -98,10 +115,25 @@ without changing the behaviour it had already determined. Construct a new loss i
   siblings did not.
 - Inputs of 512-1024 samples now warn about which STFT resolutions were dropped. The resolutions used are
   unchanged; the arity of the multi-resolution average is simply no longer silent.
+- **If you lower `min_audio_length` below 512, inputs of 257-511 samples now compute a real STFT loss where
+  they previously fell back to the time domain.** The old length check rejected an input whenever *any*
+  configured hop produced fewer than two frames, which below 512 samples was always true, so the fallback was
+  unreachable-by-design rather than deliberate. Per-resolution checking now admits the resolutions that
+  genuinely fit. The value changes by about 90% across that band (measured -9.12 to -17.14 at 300 samples),
+  because the objective changes from one time-domain D1 to a one-resolution STFT loss. At the default
+  `min_audio_length=512` nothing in this band is reachable and nothing changes.
 
-**Not breaking, but stated for completeness:** `dbrms` applied a second, dimensionally inconsistent epsilon
-outside the square root. It could never prevent a log of zero and is removed. Measured effect below 0.001 dB
-across levels from silence to 10.0; the -80 dB silence floor is preserved exactly.
+**`dbrms` lost a redundant epsilon.** It applied a second, dimensionally inconsistent epsilon outside the
+square root, on an amplitude, where the first already sits inside on a power. The outer one could never
+prevent a log of zero and is removed. The silence floor becomes exactly -80 dB rather than -79.99913.
+
+At the default `dbrms_eps=1e-8` the effect on a level is below 0.001 dB across target levels from silence to
+10.0. **That bound is a property of the default, not of the change**: `dbrms_eps` is a documented constructor
+parameter, and at 1e-4 the shift is 0.017 dB and at 1e-2 it is 0.74 dB. If you have raised `dbrms_eps`, treat
+this as a breaking change rather than a rounding one.
+
+Note also that this is the larger of the two contributors to the loss-value differences in the compatibility
+table above, because the regularizer amplifies a level shift when a level sits near the floor.
 
 ### Performance
 

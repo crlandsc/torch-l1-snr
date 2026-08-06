@@ -667,12 +667,11 @@ class STFTL1SNRDBLoss(torch.nn.Module):
 
         # MPS CPU fallback for correct gradients
         self.mps_cpu_fallback = mps_cpu_fallback
-        # Transforms are constructed on CPU; forward moves them only when the input device differs.
-        self._transforms_device = torch.device("cpu")
         self._mps_warned = False
         self._nan_warned = False
         self._fallback_warned = False
         self._dropped_warned = False
+        self._allfailed_warned = False
 
 
     @property
@@ -885,11 +884,20 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         total_spec_reg_loss = torch.zeros((), dtype=acc_dtype, device=compute_device)
         valid_transforms = 0
 
-        # Ensure transforms are on the correct device. Guarded rather than unconditional: .to() on an
-        # already-correct device still walks every submodule and buffer on every call.
-        if self._transforms_device != compute_device:
-            self.spectrogram_transforms.to(compute_device)
-            self._transforms_device = compute_device
+        # Ensure transforms are on the correct device. Unconditional, deliberately.
+        #
+        # T4-5 guarded this against a cached `self._transforms_device` to save the submodule walk. That was
+        # worth 0.02 ms, about 0.007% of a forward, and it introduced a silent-zero bug: nn.Module.to() moves
+        # the window buffers but cannot update a plain Python attribute, so after `loss.to(device)` the cache
+        # still said "cpu" while the buffers had moved. The guard then skipped a move that was needed, every
+        # resolution failed on a device mismatch, and the spectral loss became exactly 0.0 with a zero
+        # gradient. On Apple silicon that is the *default* path, because mps_cpu_fallback moves the input to
+        # CPU and so `compute_device` is cpu while the buffers are on MPS.
+        #
+        # A truthful guard is possible -- compare against `self.spectrogram_transforms[0].window.device`
+        # rather than a cache -- but 0.007% does not justify carrying an invariant that can silently zero a
+        # training signal. Reverted.
+        self.spectrogram_transforms.to(compute_device)
 
         # Process each usable resolution. The try/except blocks below remain as a backstop, but with the
         # requirement checked up front they should no longer be the mechanism that decides the arity.
@@ -950,13 +958,15 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # If all transforms failed, return a zero that is still attached to the graph. A bare
         # torch.tensor(0.0) has no grad_fn, so .backward() raises here and, worse, silently contributes
         # nothing inside MultiL1SNRDBLoss while the time term goes on training.
-        if valid_transforms == 0:
+        if valid_transforms == 0 and not self._allfailed_warned:
+            self._allfailed_warned = True
             warnings.warn(
                 f"{self.name}: every spectrogram resolution failed, so the spectral loss is zero and "
                 "carries no learning signal. Check n_ffts against your input length.",
                 RuntimeWarning,
                 stacklevel=2,
             )
+        if valid_transforms == 0:
             return (est_source.sum() * 0.0).to(device) * self.weight
 
         # Average losses across valid transforms
@@ -1097,14 +1107,18 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         win_lengths: List[int] = [512, 1024, 2048],
         window_fn: str = 'hann',
         min_audio_length: int = 512,
-        spec_reg_coef: float = 0.1,
-        ref_level: float = 0.05,
-        spec_ref_level: Optional[float] = None,
         # Allow for separate parameter overrides (e.g. different delta_lambda for time and spec)
         time_loss_params: Optional[dict] = None,
         spec_loss_params: Optional[dict] = None,
         # MPS workaround
         mps_cpu_fallback: bool = True,
+        # New in 0.1.4/0.2.0, appended so that positional calls written against 0.1.3 keep their
+        # meaning. Inserting mid-signature silently reinterpreted a 17-argument positional call:
+        # time_loss_params landed in spec_reg_coef and the user's overrides were discarded without
+        # error. Keep additions here.
+        spec_reg_coef: float = 0.1,
+        ref_level: float = 0.05,
+        spec_ref_level: Optional[float] = None,
         check_finite: bool = True,
     ):
         super().__init__()
