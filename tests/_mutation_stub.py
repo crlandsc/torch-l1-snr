@@ -8,7 +8,7 @@ almost any test and would tell us nothing about discriminating power.
 """
 import torch_l1_snr.l1snr as _l1snr
 
-CLASSES = ["L1SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]
+CLASSES = ["L1SNRLoss", "L2SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]
 
 
 def _stub_forward(self, estimates, actuals, *args, **kwargs):

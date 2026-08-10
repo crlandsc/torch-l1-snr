@@ -14,7 +14,7 @@ import pytest
 
 import torch_l1_snr.l1snr as _l1snr
 
-CLASSES = ["L1SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]
+CLASSES = ["L1SNRLoss", "L2SNRLoss", "L1SNRDBLoss", "STFTL1SNRDBLoss", "MultiL1SNRDBLoss"]
 _calls = {"n": 0}
 _records = {}
 

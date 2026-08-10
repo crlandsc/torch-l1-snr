@@ -154,6 +154,56 @@ this as a breaking change rather than a rounding one.
 Note also that this is the larger of the two contributors to the loss-value differences in the compatibility
 table above, because the regularizer amplifies a level shift when a level sits near the floor.
 
+### Added
+
+**`L2SNRLoss`, an experimental energy-ratio time-domain loss.** Computes
+`10*log10((mean(e^2) + tau*mean(y^2) + eps) / (mean(y^2) + eps))`, the tau-clamped SNR of the universal
+sound separation literature, written as a ratio so it mirrors `L1SNRLoss`. Where `L1SNRLoss` measures
+mean-absolute error, this measures error energy, which is what SDR measures.
+
+This is **opt-in and nothing selects it by default.** No existing loss changes because it exists, and no
+default anywhere moves. It ships so that a metric-matched objective can be compared against `D1` on a real
+training run rather than argued about: the theoretical case for matching the metric's norm is real, but
+published music-separation results point the other way, with both Demucs (arXiv:1911.13254) and HS-TasNet
+(arXiv:2402.17701) choosing L1 after finding SI-SNR and SD-SDR converged more slowly and scored worse.
+
+Two floors, both load-bearing. `tau` (default `1e-3`) is relative to the target and bounds the `1/x`
+gradient growth as a source converges. `eps` (default `1e-6`) is absolute and is what keeps a **silent**
+target finite: `tau*mean(y^2)` is zero when the target is zero, so `tau` alone would leave
+`10*log10(mean(e^2))` unfloored on exactly the silent chunks that are common in stem training.
+
+The effective floor is whichever dominates, `tau*mean(y^2) + eps`, so **both the cap and the gradient
+ceiling are level-dependent** and the README says so. The 30 dB cap holds only above roughly -30 dBFS RMS;
+below that `eps` takes over (-19.6 dB best attainable at -40 dBFS, -3.0 dB at -60 dBFS). The gradient
+ceiling is `c/sqrt(tau*mean(y^2) + eps)`, so it is 4343 on a silent target and about 136 at 0 dBFS, against
+`L1SNRLoss`'s level-independent 4343. Choosing `eps = eps'^2 = 1e-6` is what matches the two ceilings **at
+silence**, which is where the unfloored blow-up would otherwise happen; it does not match them everywhere.
+
+**`MultiL1SNRDBLoss` gains `time_loss_module`.** An optional pre-built module replacing the built-in
+`L1SNRDBLoss` time-domain branch, so a different time-domain objective can be A/B'd without a second
+multi-domain class. Default `None` keeps the built-in loss and the behaviour of every prior version, and the
+parameter is appended after `check_finite` so positional calls written against 0.1.3 keep their meaning.
+When supplied, `time_loss_params` and `use_time_regularization` no longer apply and a `UserWarning` says so;
+parameters shared with the spectrogram branch (`lambda0`, `delta_lambda`, `l1snr_eps`, `dbrms_eps`, `lmin`,
+`l1_weight`, `ref_level`) still work but reach only that branch. `spec_weight` and `weight` are unaffected.
+
+**Precision note.** Do not run `L2SNRLoss` in pure float16 and do not lower `eps` below `1e-6` if you
+might. float16's smallest subnormal is `5.96e-08`, so `eps=1e-8` rounds to zero, the floor disappears, and a
+silent target returns `+inf`. The `1e-6` default survives only as a float16 subnormal, so subnormal-flushing
+hardware breaks it too. bfloat16 is unaffected (float32's exponent range despite fewer mantissa bits) and
+`torch.autocast` promotes the reduction and the log to float32. Gated.
+
+**Scale note, and it affects how the two are compared.** `L2SNRLoss` reports about twice the decibels
+`L1SNRLoss` does for the same estimate, because `L1SNRLoss` takes `10*log10` of an amplitude ratio (bandit's
+convention, preserved bit-exactly) while a power ratio in decibels is `10*log10`. Measured ratio 1.9x-2.1x.
+Inside `MultiL1SNRDBLoss` that doubles the time branch's share of the objective at an unchanged
+`spec_weight` (`|time|/|spectral|` 0.518 -> 1.101 at `spec_weight=0.5`), so swapping only the time loss
+varies the norm and the domain balance together. Raise `spec_weight` to roughly 0.68 in the L2 arm, or sweep
+it. Documented on both classes and gated.
+
+Both additions are covered by the mutation gate, which stubs `L2SNRLoss.forward` alongside the other four
+classes; detection stayed at 100%.
+
 ### Performance
 
 `STFTL1SNRDBLoss` and `MultiL1SNRDBLoss` gain `check_finite` (default `True`, preserving current behaviour).

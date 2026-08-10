@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 import torch_l1_snr
 from torch_l1_snr import (
     L1SNRLoss,
+    L2SNRLoss,
     L1SNRDBLoss,
     STFTL1SNRDBLoss,
     MultiL1SNRDBLoss,
@@ -32,7 +33,7 @@ SOURCE = (REPO / "torch_l1_snr" / "l1snr.py").read_text()
 LICENSE = (REPO / "LICENSE").read_text()
 SETUP_CFG = (REPO / "setup.cfg").read_text()
 
-ALL_CLASSES = [L1SNRLoss, L1SNRDBLoss, STFTL1SNRDBLoss, MultiL1SNRDBLoss]
+ALL_CLASSES = [L1SNRLoss, L2SNRLoss, L1SNRDBLoss, STFTL1SNRDBLoss, MultiL1SNRDBLoss]
 
 # Every version published to PyPI, established from the PyPI JSON API during the audit.
 PUBLISHED_VERSIONS = ["0.0.1", "0.0.2", "0.0.3", "0.0.4", "0.0.5",
@@ -42,7 +43,7 @@ PUBLISHED_VERSIONS = ["0.0.1", "0.0.2", "0.0.3", "0.0.4", "0.0.5",
 # The README is known to contain this many runnable python examples. Pinned so the gates below cannot
 # silently evaporate: they are parametrized over the discovered blocks, so if the fence syntax changed and
 # the regex stopped matching, pytest would collect zero cases and report success rather than failure.
-EXPECTED_README_EXAMPLES = 6
+EXPECTED_README_EXAMPLES = 7
 
 
 def readme_python_blocks():

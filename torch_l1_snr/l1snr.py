@@ -324,6 +324,114 @@ class L1SNRLoss(torch.nn.Module):
         return loss * self.weight
 
 
+class L2SNRLoss(torch.nn.Module):
+    """
+    Energy-ratio sibling of L1SNRLoss: a log of floored error ENERGY rather than of mean-absolute error.
+
+      D2 = 10 * log10( (mean((ŷ - y)^2) + tau * mean(y^2) + eps) / (mean(y^2) + eps) )
+      L2SNR_loss = mean(D2)
+
+    Note the parentheses: every term is a mean OF SQUARES, not a square of a mean. Reading
+    `mean(y)^2` literally gives roughly zero for zero-mean audio and a value about 18 dB off.
+
+    This is the tau-clamped SNR of the universal-sound-separation literature, written as a ratio so it
+    matches L1SNRLoss's shape. It exists because uSDR is an energy ratio, so an energy-ratio loss is the
+    metric-matched choice, whereas D1 measures mean-absolute error. Whether metric-matching actually wins
+    for music separation is unsettled -- published results point the other way (Demucs and HS-TasNet both
+    chose L1 over SI-SNR/SD-SDR for MSS) -- so this ships as an opt-in arm of an A/B, not as a
+    recommendation. Nothing selects it by default.
+
+    Two floors, and both are load-bearing:
+      * `tau` is relative to the target and bounds the 1/x gradient growth as a source converges.
+      * `eps` is absolute, and it is what keeps a SILENT target finite. tau*mean(y^2) is zero when the
+        target is zero, so tau alone would leave 10*log10(mean((y_hat)^2)) unfloored on exactly the
+        silent chunks that are routine in stem training.
+
+    **The floor is whichever of the two dominates, so both the SNR cap and the gradient ceiling are
+    level-dependent.** The effective floor is `tau*mean(y^2) + eps`, so:
+
+      * The cap is -10*log10(tau) dB, i.e. 30 dB at the default, only while `mean(y^2) >> eps/tau`
+        (1e-3 at the defaults, about -30 dBFS RMS). Below that `eps` takes over and the best attainable
+        value rises: measured -29.6 dB at -20 dBFS RMS, -19.6 dB at -40 dBFS, -3.0 dB at -60 dBFS.
+      * The gradient ceiling is c/sqrt(tau*mean(y^2) + eps), which is 4343 on a silent target but only
+        about 136 at 0 dBFS. D1's ceiling is c/eps' = 4343 regardless of target level, so the two agree
+        AT SILENCE and diverge by up to ~32x on loud targets. Choosing eps = eps'^2 = 1e-6 is what makes
+        the silent-target ceilings match; it does not make them match everywhere. Both directions are
+        gated in tests/test_losses.py.
+
+    `tau=0` is accepted and simply removes the relative floor, leaving `eps` alone; the cap is then
+    undefined rather than 30 dB.
+
+    **Do not run this loss in pure float16, and do not lower `eps` below 1e-6 if you might.** float16's
+    smallest subnormal is 5.96e-08, so `eps=1e-8` rounds to exactly zero; with a silent target both
+    numerator and denominator then collapse and the loss returns **+inf**, which kills a run. The
+    default 1e-6 survives, but only as a float16 subnormal (1.013e-06), so hardware that flushes
+    subnormals to zero would break it too. float16's smallest NORMAL value is 6.1e-05, which is far too
+    large to use as a floor here, so there is no fully float16-safe setting.
+
+    bfloat16 is unaffected: it trades mantissa for exponent (8 mantissa bits against float16's 11, but
+    float32's exponent range), so it represents 1e-8 exactly while being *less* precise per digit. That
+    trade is why the wider-range format is the safe one here. `torch.autocast` is also fine on both,
+    because it promotes the reduction and the log to float32 -- measured, the returned dtype is float32
+    and the silent case gives 0.0004 rather than inf. Gated in tests/test_losses.py.
+
+    **This loss reports about TWICE the decibels D1 does for the same estimate, and that is not a bug
+    in either.** D1 takes 10*log10 of an AMPLITUDE ratio (mean|e| / mean|y|), which is the authors'
+    bandit convention and is preserved here bit-exactly; a power ratio in decibels is 10*log10, so
+    L2SNRLoss reports 20*log10 of the equivalent amplitude ratio. Measured on Gaussian error, the ratio
+    of the two losses is 1.9x to 2.1x across relative errors from 0.003 to 0.5.
+
+    The consequence is not cosmetic when this is used as `MultiL1SNRDBLoss(time_loss_module=...)`.
+    That class combines its branches as `(1 - spec_weight) * time + spec_weight * spec`, so doubling
+    the magnitude of the time term doubles its share of the objective at an unchanged `spec_weight`.
+    Measured at `spec_weight=0.5` and 10% relative error, |time| / |spectral| goes from 0.518 with D1
+    to 1.101 with this loss. **A two-arm A/B that swaps only the time loss is therefore confounded**:
+    it varies the norm and the domain balance together. Either sweep `spec_weight` in the L2 arm, or
+    raise it to roughly 0.68 to restore the D1 arm's balance. Gated in tests/test_losses.py.
+
+    Input Shape:
+        Same batch-first shapes as L1SNRLoss -- [batch, time], [batch, sources, time] or
+        [batch, sources, channels, time]. Non-batch dimensions are flattened.
+
+    Attributes:
+        name (str): Name identifier for the loss.
+        weight (float): Global weight multiplier for the loss.
+        eps (float): Absolute floor on the error energy, guarding silent targets (default 1e-6).
+        tau (float): Target-relative floor; caps SNR at -10*log10(tau) dB (default 1e-3, i.e. 30 dB).
+    """
+    def __init__(
+        self,
+        name,
+        weight: float = 1.0,
+        eps: float = 1e-6,
+        tau: float = 1e-3,
+    ):
+        super().__init__()
+        self.name = name
+        _validate_non_negative("weight", weight)
+        _validate_positive("eps", eps)
+        _validate_non_negative("tau", tau)
+        self.weight = weight
+        self.eps = eps
+        self.tau = tau
+
+    def forward(self, estimates, actuals, *args, **kwargs):
+        _validate_matching_shapes(estimates, actuals)
+        _validate_input_tensors(estimates, actuals)
+        batch_size = estimates.shape[0]
+
+        est_source = estimates.reshape(batch_size, -1)
+        act_source = actuals.reshape(batch_size, -1)
+
+        err_energy = torch.mean((est_source - act_source) ** 2, dim=-1)
+        ref_energy = torch.mean(act_source ** 2, dim=-1)
+
+        d2 = 10.0 * torch.log10(
+            (err_energy + self.tau * ref_energy + self.eps) / (ref_energy + self.eps)
+        )
+        return torch.mean(d2) * self.weight
+
+
 class L1SNRDBLoss(torch.nn.Module):
     """
     Implements L1SNR plus adaptive level-matching regularization in the time domain
@@ -1187,9 +1295,27 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             +/-1.0. See
             STFTL1SNRDBLoss for the cost and for why False is defensible.
         time_loss_params (dict): Optional additional parameters to pass to time domain loss.
-            Overrides any of the above for the time-domain component only.
+            Overrides any of the above for the time-domain component only. Ignored when
+            time_loss_module is supplied.
         spec_loss_params (dict): Optional additional parameters to pass to spectrogram domain loss.
             Overrides any of the above for the spectrogram component only.
+        time_loss_module (torch.nn.Module): Optional pre-built module replacing the built-in
+            L1SNRDBLoss time-domain branch, so a different time-domain objective (e.g. L2SNRLoss) can
+            be A/B'd without a second multi-domain class. Default None keeps the built-in loss and the
+            behaviour of every prior version. When supplied, time_loss_params and
+            use_time_regularization no longer apply and a warning says so; parameters shared with the
+            spectrogram branch (lambda0, delta_lambda, l1snr_eps, dbrms_eps, lmin, l1_weight,
+            ref_level) still work but reach only that branch. spec_weight and weight are unaffected.
+            Three things to know, none of which the built-in branch exposes you to:
+              * The module's OWN `weight` multiplies on top of `(1 - spec_weight) * weight`. The
+                built-in branch is constructed with `weight=1.0` for exactly this reason, so leave an
+                injected module's weight at 1.0 unless you intend the product.
+              * `pure_l1_mode` and `l1_weight` describe the spectrogram branch only. `l1_weight=1.0`
+                with an injected module warns, because `pure_l1_mode` then reads True while the time
+                branch is not an L1 loss.
+              * The module must return a scalar. A module returning one value per batch item makes
+                `forward` return a non-scalar, which surfaces later as an error from `backward` rather
+                than from here.
         ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
             term when l1_weight > 0. Default 0.05, the measured median for MUSDB-like stems.
             Only affects the blended path: at l1_weight=0.0 or 1.0 it is unused.
@@ -1246,6 +1372,10 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         ref_level: float = 0.05,
         spec_ref_level: Optional[float] = None,
         check_finite: bool = True,
+        # Opt-in replacement for the built-in time-domain sub-loss, for A/B-ing a different time-domain
+        # objective (e.g. L2SNRLoss) against D1 without a second multi-domain class. Appended, like every
+        # 0.2.0 addition, so positional calls written against 0.1.3 keep their meaning.
+        time_loss_module: Optional[torch.nn.Module] = None,
     ):
         super().__init__()
         # spec_weight above 1 makes the time-domain coefficient (1 - spec_weight) negative in forward,
@@ -1311,7 +1441,39 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         # Create the specialized loss components
         # Note: Component losses handle all optimizations internally based on l1_weight
         # When l1_weight=1.0, they will efficiently bypass SNR and regularization calculations
-        self.time_loss = L1SNRDBLoss(**default_time_params)
+        if time_loss_module is None:
+            self.time_loss = L1SNRDBLoss(**default_time_params)
+        else:
+            if not isinstance(time_loss_module, torch.nn.Module):
+                raise ValueError(
+                    f"time_loss_module must be a torch.nn.Module, got {type(time_loss_module).__name__}. "
+                    "Pass an instantiated loss (e.g. L2SNRLoss('time')), not a class or a name."
+                )
+            # Only these two are time-exclusive. lambda0, delta_lambda, l1snr_eps, dbrms_eps, lmin,
+            # l1_weight and ref_level are shared with the spectrogram branch and keep working, so warning
+            # on them would fire on ordinary calls.
+            if time_loss_params is not None or not use_time_regularization:
+                warnings.warn(
+                    "time_loss_module replaces the built-in time-domain loss, so time_loss_params and "
+                    "use_time_regularization no longer have any effect. Parameters shared with the "
+                    "spectrogram branch (lambda0, delta_lambda, l1snr_eps, dbrms_eps, lmin, l1_weight, "
+                    "ref_level) still apply, but now reach only that branch.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            # l1_weight at either endpoint changes what the loss IS, not just how it is weighted, and an
+            # injected module does not honour it. At 1.0 in particular `pure_l1_mode` reads True while the
+            # time branch is whatever was injected, so the attribute is actively misleading rather than
+            # merely inapplicable. Silence here would be the quiet kind of wrong.
+            if l1_weight == 1.0:
+                warnings.warn(
+                    "l1_weight=1.0 puts the spectrogram branch in pure-L1 mode, but time_loss_module is "
+                    "used as given and does not honour l1_weight. pure_l1_mode will read True while the "
+                    "time branch is not an L1 loss. Set l1_weight=0.0 unless you want that asymmetry.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            self.time_loss = time_loss_module
         self.spec_loss = STFTL1SNRDBLoss(**default_spec_params)
 
         # For reference only, indicate if we're in pure L1 mode

@@ -1,4 +1,5 @@
 import ast
+import math
 import pathlib
 
 import torch
@@ -588,3 +589,351 @@ def test_stft_l1_weight_interpolation():
     # a wider level spread means a stronger inverse-error weighting under pure SNR
     assert profiles_by_spread["40 dB"] > profiles_by_spread["20 dB"], (
         f"a wider level spread should give a larger pure-SNR profile: {profiles_by_spread}")
+
+
+# --- L2SNRLoss: the metric-matched (energy-ratio) sibling of L1SNRLoss ---
+#
+# Added for the CHRIS-394 A/B. uSDR is an energy ratio, so the derivation says the matched time-domain
+# objective is a log of floored error ENERGY rather than of mean-absolute error. Whether that actually
+# beats D1 on held-out uSDR is an open empirical question -- these gates only pin the arithmetic.
+
+def test_l2snr_is_the_hand_computed_floored_energy_ratio():
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    est = torch.randn(4, 2, 8000)
+    act = torch.randn(4, 2, 8000)
+    tau, eps = 1e-3, 1e-6
+
+    e = est.reshape(4, -1)
+    a = act.reshape(4, -1)
+    err = (e - a).pow(2).mean(dim=-1)
+    ref = a.pow(2).mean(dim=-1)
+    expected = (10.0 * torch.log10((err + tau * ref + eps) / (ref + eps))).mean()
+
+    assert torch.allclose(L2SNRLoss("t")(est, act), expected, atol=0, rtol=1e-6)
+
+
+def test_l2snr_bottoms_out_at_the_tau_implied_snr_cap():
+    """tau=1e-3 caps the attainable SNR at 30 dB, so a perfect estimate scores -30, not -inf."""
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    # Scaled up so the absolute eps is negligible against tau*mean(y^2). At unit level eps shifts the cap
+    # by a visible 0.004 dB, which is correct behaviour but not what this test is pinning.
+    act = torch.randn(2, 4000) * 10
+    assert torch.allclose(L2SNRLoss("t")(act.clone(), act), torch.tensor(-30.0), atol=1e-3)
+    assert torch.allclose(L2SNRLoss("t", tau=1e-4)(act.clone(), act), torch.tensor(-40.0), atol=1e-3)
+
+
+def test_l2snr_stays_bounded_on_a_silent_target():
+    """The tau floor is relative to the target, so it vanishes when the target is silent.
+
+    Without an absolute eps as well, a silent target leaves 10*log10(mean(e^2)) unfloored and the loss
+    runs to -inf with a gradient going as 1/mean(e^2). Silent chunks are routine in stem training.
+    """
+    from torch_l1_snr import L2SNRLoss
+    eps = 1e-6
+    loss_fn = L2SNRLoss("t", eps=eps)
+    for dtype in (torch.float32, torch.float64):
+        silent = torch.zeros(2, 4000, dtype=dtype)
+        for scale in (1e-2, 1e-5, 1e-10, 0.0):
+            out = loss_fn(silent + scale, silent)
+            assert torch.isfinite(out), f"{dtype}: non-finite loss at estimate scale {scale}"
+            assert out >= -1e-6, f"{dtype}: loss below the floor at scale {scale}: {out.item()}"
+
+            # With y=0 the target-relative tau floor vanishes, so the whole floor is eps and the loss is
+            # exactly 10*log10((scale^2 + eps) / eps). Pinning the value, not just finiteness: an
+            # isfinite/isnan pair is satisfied by any constant. Checked in float64 only -- the ratio sits
+            # a hair above 1 for small scales, where float32 cancellation in log10 costs four digits and
+            # would force a tolerance too loose to mean anything.
+            if dtype is torch.float64:
+                expected = 10.0 * math.log10((scale ** 2 + eps) / eps)
+                assert out.item() == pytest.approx(expected, rel=1e-12, abs=1e-15), (
+                    f"at estimate scale {scale}: got {out.item()}, expected {expected}")
+
+
+def test_l2snrs_peak_gradient_matches_d1s_on_a_silent_target():
+    """eps=1e-6 is the power-domain analogue of D1's amplitude-domain eps=1e-3.
+
+    log(x^2 + eps) peaks in gradient at x=sqrt(eps) with value c/sqrt(eps); log(|x| + eps') peaks at
+    c/eps'. Setting eps = eps'^2 makes the two ceilings equal, so swapping norms does not silently
+    change how hard the loss pushes near convergence.
+    """
+    from torch_l1_snr import L2SNRLoss
+
+    def peak_grad(loss_fn, amplitudes):
+        best = 0.0
+        for amp in amplitudes:
+            a = torch.tensor(float(amp), requires_grad=True)
+            loss_fn(a * torch.ones(1, 2000), torch.zeros(1, 2000)).backward()
+            best = max(best, abs(a.grad.item()))
+        return best
+
+    sweep = [10 ** (-k / 4) for k in range(2, 33)]
+    l2_peak = peak_grad(L2SNRLoss("t"), sweep)
+    d1_peak = peak_grad(L1SNRLoss("t"), sweep)
+    # Absolute value first. Asserting only that the two agree is an f(x) == f(x) comparison: it holds
+    # just as well when both losses are broken in the same way.
+    ceiling = (10.0 / math.log(10.0)) / math.sqrt(1e-6)
+    assert l2_peak == pytest.approx(ceiling, rel=0.02), (
+        f"L2SNR peak gradient should be c/sqrt(eps) = {ceiling:.1f}, got {l2_peak:.1f}")
+    assert d1_peak == pytest.approx(ceiling, rel=0.02), (
+        f"D1 peak gradient should be c/eps' = {ceiling:.1f}, got {d1_peak:.1f}")
+    assert l2_peak == pytest.approx(d1_peak, rel=0.02), (
+        f"peak gradients should match by construction: L2 {l2_peak:.1f} vs D1 {d1_peak:.1f}")
+
+
+@pytest.mark.parametrize("shape", [(3, 4000), (3, 4, 4000), (3, 4, 2, 4000)])
+def test_l2snr_flattens_every_batch_first_shape_to_one_value_per_example(shape):
+    """Value-asserted per shape, so it also proves the flatten is over ALL non-batch dims.
+
+    An ndim==0/isfinite pair would pass against a constant, and against a loss that reduced over the
+    wrong axis.
+    """
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    est, act = torch.randn(*shape), torch.randn(*shape)
+    tau, eps = 1e-3, 1e-6
+
+    e, a = est.reshape(shape[0], -1), act.reshape(shape[0], -1)
+    err, ref = (e - a).pow(2).mean(dim=-1), a.pow(2).mean(dim=-1)
+    expected = (10.0 * torch.log10((err + tau * ref + eps) / (ref + eps))).mean()
+
+    out = L2SNRLoss("t")(est, act)
+    assert out.ndim == 0
+    assert torch.allclose(out, expected, atol=0, rtol=1e-6)
+
+
+# --- MultiL1SNRDBLoss: injectable time-domain sub-loss ---
+
+def test_the_multi_domain_time_branch_can_be_replaced_by_an_injected_module():
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    est, act = torch.randn(2, 2, 16000), torch.randn(2, 2, 16000)
+
+    injected = L2SNRLoss("l2")
+    loss_fn = MultiL1SNRDBLoss("m", time_loss_module=injected)
+    assert loss_fn.time_loss is injected
+
+    # The injection must actually change the number. Comparing only against a recombination of the same
+    # sub-losses is f(x) == f(x) and holds even when every forward returns a constant.
+    default = MultiL1SNRDBLoss("m")
+    assert not torch.allclose(loss_fn(est, act), default(est, act)), (
+        "injecting L2SNRLoss left the combined loss unchanged, so the injection did nothing")
+
+    w = loss_fn.spec_weight
+    expected = (1 - w) * injected(est, act) + w * loss_fn.spec_loss(est, act)
+    assert torch.allclose(loss_fn(est, act), expected * loss_fn.weight)
+
+
+@pytest.mark.no_forward
+def test_injecting_a_time_loss_warns_that_the_time_only_parameters_are_orphaned():
+    """Only `time_loss_params` and `use_time_regularization` are time-exclusive.
+
+    lambda0, l1snr_eps, l1_weight and the rest are shared with the spectrogram branch, so they keep
+    working and must NOT warn -- warning on them would be noise on an ordinary call.
+    """
+    from torch_l1_snr import L2SNRLoss
+    with pytest.warns(UserWarning, match="time_loss_module"):
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), time_loss_params={"weight": 2.0})
+    with pytest.warns(UserWarning, match="time_loss_module"):
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), use_time_regularization=False)
+
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), lambda0=0.5, l1snr_eps=1e-2)
+
+
+@pytest.mark.no_forward
+def test_injecting_a_non_module_is_rejected():
+    with pytest.raises(ValueError, match="time_loss_module"):
+        MultiL1SNRDBLoss("m", time_loss_module="L2SNRLoss")
+
+
+def test_the_multi_domain_default_is_untouched_by_the_injection_parameter():
+    """Regression guard, not a red-green gate: this must hold before and after the change."""
+    torch.manual_seed(0)
+    est, act = torch.randn(2, 2, 16000), torch.randn(2, 2, 16000)
+    loss_fn = MultiL1SNRDBLoss("m")
+    assert isinstance(loss_fn.time_loss, L1SNRDBLoss)
+    assert loss_fn(est, act).item() == pytest.approx(2.230844497680664, abs=0, rel=1e-6)
+
+
+# --- L2SNRLoss: the cross-class gates it does not inherit ---
+#
+# tests/test_edge_cases.py parametrizes ~21 gates over its own ALL_CLASSES, but every one of them assumes
+# an `l1_weight` parameter, which L2SNRLoss deliberately does not have. Adding it to that list would fail
+# for the wrong reason, so the universal contracts are pinned here instead. An adversarial reviewer found
+# all three of these mutations surviving the whole numerical suite.
+
+@pytest.mark.parametrize("weight", [0.0, 0.5, 2.0, 3.7])
+def test_l2snr_weight_multiplier_scales_the_loss(weight):
+    """Mutation that survived: deleting `* self.weight` from forward()."""
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    est, act = torch.randn(3, 8000), torch.randn(3, 8000)
+    base = L2SNRLoss("t").forward(est, act)
+    assert torch.allclose(L2SNRLoss("t", weight=weight)(est, act), base * weight, atol=0, rtol=1e-6)
+
+
+@pytest.mark.no_forward  # constructor validation only; verified by tests/_forward_counter.py
+@pytest.mark.parametrize("kwargs, field", [
+    ({"weight": -1.0}, "weight"),      # negates the objective
+    ({"weight": -1e-9}, "weight"),
+    ({"eps": 0.0}, "eps"),             # un-floors a silent target
+    ({"eps": -1e-6}, "eps"),
+    ({"tau": -1e-9}, "tau"),
+])
+def test_l2snr_rejects_out_of_range_constructor_values(kwargs, field):
+    """Mutation that survived: deleting the _validate_* calls from __init__."""
+    from torch_l1_snr import L2SNRLoss
+    with pytest.raises(ValueError, match=field):
+        L2SNRLoss("t", **kwargs)
+
+
+def test_l2snr_rejects_the_input_shapes_and_dtypes_every_other_loss_rejects():
+    """Mutation that survived: deleting both _validate_* calls from forward().
+
+    Each of these returned a plausible number or a silent NaN instead of raising.
+    """
+    from torch_l1_snr import L2SNRLoss
+    loss_fn = L2SNRLoss("t")
+    with pytest.raises(ValueError):                                   # rank-1: no batch dimension
+        loss_fn(torch.randn(4000), torch.randn(4000))
+    with pytest.raises(ValueError):                                   # empty -> NaN
+        loss_fn(torch.zeros(2, 0, 4000), torch.zeros(2, 0, 4000))
+    with pytest.raises(ValueError):                                   # integer dtype
+        loss_fn(torch.zeros(2, 400, dtype=torch.int16), torch.zeros(2, 400, dtype=torch.int16))
+    with pytest.raises(ValueError):                                   # mismatched shapes
+        loss_fn(torch.randn(2, 4000), torch.randn(2, 8000))
+
+
+def test_l2snrs_gradient_ceiling_rises_with_the_target_level():
+    """The eps-matching derivation holds at silence ONLY, and the docs must not overstate it.
+
+    On a non-silent target the floor inside the log is tau*mean(y^2) + eps, so the ceiling is
+    c/sqrt(tau*mean(y^2) + eps) rather than c/sqrt(eps). At 0 dBFS that is ~32x below D1's, which is
+    target-independent. Pinning the direction so the claim cannot silently drift back.
+    """
+    from torch_l1_snr import L2SNRLoss
+    c = 10.0 / math.log(10.0)
+    loss_fn = L2SNRLoss("t")
+
+    def peak_grad(ref_energy):
+        best = 0.0
+        for amp in (10 ** (-k / 4) for k in range(0, 33)):
+            a = torch.tensor(float(amp), requires_grad=True, dtype=torch.float64)
+            act = torch.full((1, 2000), math.sqrt(ref_energy), dtype=torch.float64)
+            loss_fn(act + a, act).backward()
+            best = max(best, abs(a.grad.item()))
+        return best
+
+    silent, loud = peak_grad(0.0), peak_grad(1.0)
+    assert silent == pytest.approx(c / math.sqrt(1e-6), rel=0.02)
+    assert loud == pytest.approx(c / math.sqrt(1e-3 + 1e-6), rel=0.02)
+    assert silent > 20 * loud, (
+        f"ceiling must fall as the target gets louder: silent {silent:.1f} vs 0 dBFS {loud:.1f}")
+
+
+@pytest.mark.no_forward  # construction-time warning only; verified by tests/_forward_counter.py
+def test_injecting_a_time_loss_with_pure_l1_mode_warns_about_the_asymmetry():
+    """pure_l1_mode reads True while the injected time branch is not an L1 loss.
+
+    Found by an adversarial reviewer: this combination silently produced a public attribute that was
+    simply wrong, with no warning of any kind.
+    """
+    from torch_l1_snr import L2SNRLoss
+    with pytest.warns(UserWarning, match="pure_l1_mode"):
+        m = MultiL1SNRDBLoss("m", l1_weight=1.0, time_loss_module=L2SNRLoss("l2"))
+    assert m.pure_l1_mode is True  # the asymmetry the warning exists to announce
+
+    import warnings as _w
+    with _w.catch_warnings():
+        _w.simplefilter("error")
+        MultiL1SNRDBLoss("m", l1_weight=0.0, time_loss_module=L2SNRLoss("l2"))
+
+
+def test_an_injected_modules_own_weight_multiplies_on_top_of_the_branch_weight():
+    """Documented asymmetry: the built-in branch is forced to weight=1.0, an injected one is not."""
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    est, act = torch.randn(2, 16000), torch.randn(2, 16000)
+    plain = MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"))
+    scaled = MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2", weight=3.0))
+    w = plain.spec_weight
+    delta = 2.0 * (1 - w) * L2SNRLoss("l2")(est, act)   # the extra 2x on the time branch only
+    assert torch.allclose(scaled(est, act) - plain(est, act), delta, atol=0, rtol=1e-6)
+
+
+def test_l2snr_reports_about_twice_the_decibels_d1_does():
+    """D1 is 10log10 of an AMPLITUDE ratio (bandit's convention); L2SNR is 10log10 of a POWER ratio.
+
+    Pinned because the consequence is easy to miss and expensive: inside MultiL1SNRDBLoss the branches
+    are summed as (1-spec_weight)*time + spec_weight*spec, so a time term of twice the magnitude takes
+    twice the share of the objective at an unchanged spec_weight. An A/B that swaps only the norm is
+    confounded with a domain-balance change unless spec_weight is adjusted.
+    """
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    for r in (0.3, 0.1, 0.03, 0.01):
+        y = torch.randn(8, 40000, dtype=torch.float64) * 0.05
+        est = y + r * torch.randn_like(y) * 0.05
+        d1 = L1SNRLoss("t")(est, y).item()
+        # eps tiny so the comparison is of the norms, not of the two floors
+        d2 = L2SNRLoss("t", eps=1e-30)(est, y).item()
+        assert 1.8 < d2 / d1 < 2.3, f"at relative error {r}: ratio {d2/d1:.3f}, expected ~2"
+
+
+def test_swapping_the_time_norm_shifts_the_multi_domain_balance():
+    """The confound itself, measured end to end, so the A/B design cannot forget it."""
+    from torch_l1_snr import L2SNRLoss
+    torch.manual_seed(0)
+    y = torch.randn(4, 40000) * 0.05
+    est = y + 0.1 * torch.randn_like(y) * 0.05
+
+    spec = STFTL1SNRDBLoss("s", use_regularization=False)(est, y).abs().item()
+    share_d1 = L1SNRLoss("t")(est, y).abs().item() / spec
+    share_l2 = L2SNRLoss("t")(est, y).abs().item() / spec
+
+    assert share_l2 > 1.8 * share_d1, (
+        f"the time branch should roughly double its share: D1 {share_d1:.3f} vs L2 {share_l2:.3f}")
+
+
+@pytest.mark.parametrize("eps,fp16_safe", [(1e-6, True), (1e-8, False)])
+def test_l2snr_eps_below_float16s_subnormal_floor_gives_inf_on_a_silent_target(eps, fp16_safe):
+    """float16's smallest subnormal is 5.96e-08, so eps=1e-8 rounds to zero and the floor disappears.
+
+    Numerator and denominator then both collapse on a silent target and the loss returns +inf, which
+    kills a training run. This is the concrete reason not to lower the eps default. bfloat16 is fine:
+    it has float32's exponent range, so it represents 1e-8 exactly despite having FEWER mantissa bits.
+    """
+    from torch_l1_snr import L2SNRLoss
+    loss_fn = L2SNRLoss("t", eps=eps)
+
+    assert (torch.tensor(eps, dtype=torch.float16).item() != 0.0) is fp16_safe
+
+    # With a silent target the whole floor is eps, so the exact value is 10*log10((scale^2 + eps)/eps).
+    # Asserting the VALUE, not just finiteness: a stubbed constant forward() is finite too.
+    scale = 1e-2
+    expected = 10.0 * math.log10((scale ** 2 + eps) / eps)
+
+    silent16 = torch.zeros(2, 4000, dtype=torch.float16)
+    out16 = loss_fn(silent16 + scale, silent16)
+    assert bool(torch.isfinite(out16)) is fp16_safe, (
+        f"float16 at eps={eps:.0e} gave {out16.item()}, expected "
+        f"{'a finite value' if fp16_safe else '+inf (eps flushed to zero)'}")
+    if fp16_safe:
+        assert out16.item() == pytest.approx(expected, abs=0.1)
+
+    # bfloat16 survives either way: float32's exponent range, despite fewer mantissa bits.
+    silentbf = torch.zeros(2, 4000, dtype=torch.bfloat16)
+    outbf = loss_fn(silentbf + scale, silentbf)
+    assert outbf.item() == pytest.approx(expected, abs=0.1), (
+        f"bfloat16 at eps={eps:.0e} gave {outbf.item()}, expected {expected:.4f}")
+
+    # autocast promotes the reduction and the log to float32, so it survives too.
+    with torch.autocast(device_type="cpu", dtype=torch.float16):
+        silent32 = torch.zeros(2, 4000)
+        out = loss_fn(silent32 + scale, silent32)
+    assert out.item() == pytest.approx(expected, abs=0.1), (
+        f"autocast(float16) at eps={eps:.0e} gave {out.item()}, expected {expected:.4f}")
