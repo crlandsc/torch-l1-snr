@@ -116,7 +116,10 @@ def main():
         return 1
 
     ratio = failed / total
-    print(f"stubbed forward() to a constant on all four loss classes")
+    # Read the count from the stub rather than hard-coding it. It said "all four" while the stub covered
+    # five, which is the kind of drift that makes a reader trust a narrower gate than they have.
+    from _mutation_stub import CLASSES as _STUBBED
+    print(f"stubbed forward() to a constant on {len(_STUBBED)} loss classes: {', '.join(_STUBBED)}")
     print(f"  {failed} failed, {passed} passed" + (f", {errors} errors" if errors else ""))
     print(f"  detection ratio: {ratio:.1%} of {total} tests noticed")
     print(f"  required:        {args.min:.1%}")

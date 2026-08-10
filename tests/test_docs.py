@@ -478,7 +478,11 @@ def test_the_changelog_states_positional_compatibility_as_a_guarantee():
     happened -- the reordering was introduced by the "fix" itself. A user reading that would go looking for a
     migration they do not need, in the one section they are told to read before upgrading.
     """
-    breaking = CHANGELOG[CHANGELOG.index("### BREAKING CHANGES"):CHANGELOG.index("### Performance")]
+    # Bounded by the NEXT "### " heading, not by "### Performance". Hard-coding the following heading
+    # meant that inserting any section between the two silently widened the slice: the 0.2.0 "### Added"
+    # section landed there and carried its own "keep their meaning", so deleting the phrase from the real
+    # BREAKING section would no longer have failed this gate.
+    breaking = CHANGELOG.split("### BREAKING CHANGES")[1].split("### ")[0]
     assert "keep their meaning" in breaking, (
         "the BREAKING section must state that positional calls written against 0.1.3 still mean the same "
         "thing; it is the first thing a cautious upgrader checks")
