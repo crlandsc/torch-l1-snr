@@ -51,6 +51,13 @@ def expected(cls, est, act, **kw):
     if name == "STFTL1SNRDBLoss":
         return reference.multi_res_spec_d1(est, act, l1_weight=kw.get("l1_weight", 0.0),
                                            spec_ref_level=kw.get("spec_ref_level", 0.19 * 0.05))
+    if name != "MultiL1SNRDBLoss":
+        # Fall-through used to silently return the MultiL1SNRDBLoss formula for any unrecognised class,
+        # so a newly added loss would be "verified" against the wrong reference and pass. Surfaced by an
+        # adversarial reviewer when L2SNRLoss was added to the package.
+        raise NotImplementedError(
+            f"expected() has no reference for {name}. Add one to tests/reference.py and a branch here "
+            "rather than letting it fall through to the MultiL1SNRDBLoss formula.")
     sw = kw.get("spec_weight", 0.5)
     return ((1.0 - sw) * reference.l1snr_db(est, act, l1_weight=kw.get("l1_weight", 0.0),
                                             use_regularization=kw.get("use_time_regularization", True),
