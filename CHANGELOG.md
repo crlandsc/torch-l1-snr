@@ -298,6 +298,17 @@ test that exercises a `forward` must fail when it returns a constant) and a cove
 v0.1.2 fix now breaks 50 tests. The MPS tests were rewritten to use an input size where the underlying
 PyTorch bug actually manifests; the previous ones compared CPU against CPU and would have passed regardless.
 
+The suite also no longer litters the working tree. `tests/test_docs.py` used `tempfile.mkdtemp()` and
+`tests/mutation_gate.py --audit-markers` used `tempfile.mktemp()`, both of which trust
+`tempfile.gettempdir()` to point outside the repository. It does not always: `gettempdir()` probes `TMPDIR`,
+`TEMP`, `TMP`, `/tmp`, `/var/tmp` and `/usr/tmp` for writability and falls back to `os.getcwd()` when all of
+them fail, which is what a sandboxed or locked-down `/tmp` produces. Both then wrote into the repository
+root, and neither path was gitignored. This is environment-dependent rather than universal: on the
+`ubuntu-latest` runner `/tmp` is writable, so CI never saw it, and it reproduces wherever `/tmp` is not.
+Both now use
+`tempfile.TemporaryDirectory`, which cleans up wherever it lands, and a new gate asserts that running them
+adds nothing to `git status --porcelain --untracked-files=all`.
+
 ### Packaging
 
 - Removed `numpy` from the dependencies. It was declared and documented but never imported.

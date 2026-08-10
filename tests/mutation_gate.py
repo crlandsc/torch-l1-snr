@@ -64,20 +64,27 @@ def audit_markers():
     until an adversarial reviewer pointed out that "a reviewer would see it in the diff" is not a gate.
     """
     import json
+    import os
     import tempfile
-    out = tempfile.mktemp(suffix=".json")
-    subprocess.run(
-        [sys.executable, "-m", "pytest", *TARGETS, "-p", "_forward_counter", "-q", "--no-header",
-         "--tb=no"],
-        cwd=REPO, capture_output=True, text=True,
-        env={**__import__("os").environ, "PYTHONPATH": str(REPO / "tests"),
-             "FORWARD_COUNTER_OUT": out},
-    )
-    try:
-        records = json.load(open(out))
-    except Exception:
-        print("MARKER AUDIT: could not collect forward-call records")
-        return 1
+    # A TemporaryDirectory rather than tempfile.mktemp(): mktemp leaves the file behind, and
+    # tempfile.gettempdir() falls back to os.getcwd() when every standard candidate fails its
+    # writability probe (a sandboxed or locked-down /tmp), so the report landed in the repo root on
+    # every CI run. mktemp is also deprecated for the usual race reasons.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = os.path.join(tmpdir, "forward_calls.json")
+        subprocess.run(
+            [sys.executable, "-m", "pytest", *TARGETS, "-p", "_forward_counter", "-q", "--no-header",
+             "--tb=no"],
+            cwd=REPO, capture_output=True, text=True,
+            env={**os.environ, "PYTHONPATH": str(REPO / "tests"),
+                 "FORWARD_COUNTER_OUT": out},
+        )
+        try:
+            with open(out) as fh:
+                records = json.load(fh)
+        except Exception:
+            print("MARKER AUDIT: could not collect forward-call records")
+            return 1
     liars = [k for k, v in records.items() if v["marked_no_forward"] and v["forward_calls"] > 0]
     marked = sum(1 for v in records.values() if v["marked_no_forward"])
     print(f"marker audit: {marked} tests claim no_forward, {len(records)} tests inspected")

@@ -547,6 +547,7 @@ def test_changelog_compatibility_bounds_are_not_exceeded():
     regularizer's |L_pred - L_true| term when a level sits near the -80 dB floor, so it shows up in float64
     too and is not a rounding effect.
     """
+    import os as _os
     import re as _re
     import subprocess as _sub
     import tempfile as _tmp
@@ -565,11 +566,16 @@ def test_changelog_compatibility_bounds_are_not_exceeded():
 
     src = _sub.run(["git", "-C", str(REPO), "show", "938b4f1:torch_l1_snr/l1snr.py"],
                    capture_output=True, text=True, check=True).stdout
-    path = _tmp.mkdtemp() + "/base.py"
-    open(path, "w").write(src)
-    spec = _il.spec_from_file_location("base_bounds", path)
-    base = _il.module_from_spec(spec)
-    spec.loader.exec_module(base)
+    # TemporaryDirectory, not mkdtemp: tempfile.gettempdir() falls back to os.getcwd() when every
+    # standard candidate fails its writability probe, which happens under a sandboxed or locked-down
+    # /tmp. mkdtemp then leaves a directory in the repo root on every run. Where it lands is the
+    # environment's business; cleaning it up is ours.
+    with _tmp.TemporaryDirectory() as _d:
+        path = _os.path.join(_d, "base.py")
+        open(path, "w").write(src)
+        spec = _il.spec_from_file_location("base_bounds", path)
+        base = _il.module_from_spec(spec)
+        spec.loader.exec_module(base)
 
     import torch_l1_snr.l1snr as cur
     worst = {}
@@ -591,3 +597,46 @@ def test_changelog_compatibility_bounds_are_not_exceeded():
         assert worst.get(cls, 0.0) <= bound * 1.5, (
             f"the CHANGELOG says {cls} differs by up to {bound:.1e} relative; measured "
             f"{worst[cls]:.2e}, which is {worst[cls] / bound:.0f}x the stated bound")
+
+
+# --------------------------------------------------------------------------------------
+# Working-tree hygiene -- the suite must not litter the repo
+# --------------------------------------------------------------------------------------
+
+@pytest.mark.no_forward  # inspects process side effects, not any loss forward()
+def test_running_the_suite_leaves_no_untracked_files_behind():
+    """Both leaks came from trusting tempfile.gettempdir() to be outside the repo.
+
+    It is not, necessarily: gettempdir() probes TMPDIR, TEMP, TMP, /tmp, /var/tmp and /usr/tmp for
+    writability and falls back to os.getcwd() when all of them fail, which is what a sandboxed or
+    locked-down /tmp produces. tempfile.mktemp() and mkdtemp() then wrote a JSON report and a
+    directory of copied source into the repo root on every run, neither of them gitignored, so
+    `git status` came back dirty after running the tests. CI hit the mktemp one on every push.
+
+    Asserting on git's own view rather than globbing for `tmp*`, so a differently-named leak still
+    fails this.
+    """
+    import os as _os
+    import subprocess as _sub
+
+    def untracked():
+        out = _sub.run(["git", "-C", str(REPO), "status", "--porcelain", "--untracked-files=all"],
+                       capture_output=True, text=True, check=True).stdout
+        return {ln[3:] for ln in out.splitlines() if ln.startswith("??")}
+
+    before = untracked()
+
+    # The two operations that leaked. Scoped to one test and one script run rather than the whole
+    # suite, so this gate stays cheap enough to live in it.
+    env = {**_os.environ, "PYTHONPATH": str(REPO / "tests")}
+    _sub.run([sys.executable, "-m", "pytest", str(REPO / "tests" / "test_docs.py"),
+              "-k", "changelog_compatibility_bounds_are_not_exceeded", "-q", "--no-header"],
+             cwd=REPO, capture_output=True, text=True, env=env)
+    _sub.run([sys.executable, str(REPO / "tests" / "mutation_gate.py"), "--audit-markers"],
+             cwd=REPO, capture_output=True, text=True, env=env)
+
+    leaked = untracked() - before
+    assert not leaked, (
+        "running the test suite left untracked files in the repo: "
+        f"{sorted(leaked)}. Use tempfile.TemporaryDirectory (which cleans up wherever it lands) "
+        "rather than mkdtemp/mktemp.")
