@@ -191,11 +191,11 @@ parameters shared with the spectrogram branch (`lambda0`, `delta_lambda`, `l1snr
 might. float16's smallest subnormal is `5.96e-08`, so `eps=1e-8` rounds to zero, the floor disappears, and a
 silent target returns `+inf`. The `1e-6` default survives only as a float16 subnormal, so subnormal-flushing
 hardware breaks it too. bfloat16 is unaffected (float32's exponent range despite fewer mantissa bits) and
-`torch.autocast` promotes the reduction and the log to float32. Gated.
+`torch.autocast` does **not** rescue it: `mean` and `log10` are not autocast-cast ops, so the computation stays in the input dtype. A typical mixed-precision loop survives through ordinary dtype promotion in `estimates - actuals`, not through autocast.
 
 **Scale note, and it affects how the two are compared.** `L2SNRLoss` reports about twice the decibels
 `L1SNRLoss` does for the same estimate, because `L1SNRLoss` takes `10*log10` of an amplitude ratio (bandit's
-convention, preserved bit-exactly) while a power ratio in decibels is `10*log10`. Measured ratio 1.9x-2.1x.
+convention, preserved bit-exactly) while a power ratio in decibels is `10*log10`. Measured ratio at the defaults 1.26x-2.13x, depending on target level and how converged the estimate is; it is not a fixed 2x. Error shape moves it too: at fixed error energy, D2 is shape-blind while D1 scores impulsive error better, so 0.1%-duty error gives 1.26x where Gaussian gives 2.13x.
 Inside `MultiL1SNRDBLoss` that doubles the time branch's share of the objective at an unchanged
 `spec_weight` (`|time|/|spectral|` 0.518 -> 1.101 at `spec_weight=0.5`), so swapping only the time loss
 varies the norm and the domain balance together. Raise `spec_weight` to roughly 0.68 in the L2 arm, or sweep

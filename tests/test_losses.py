@@ -627,8 +627,10 @@ def test_l2snr_bottoms_out_at_the_tau_implied_snr_cap():
 def test_l2snr_stays_bounded_on_a_silent_target():
     """The tau floor is relative to the target, so it vanishes when the target is silent.
 
-    Without an absolute eps as well, a silent target leaves 10*log10(mean(e^2)) unfloored and the loss
-    runs to -inf with a gradient going as 1/mean(e^2). Silent chunks are routine in stem training.
+    Without an absolute eps as well, a silent target leaves the DENOMINATOR unfloored too, so the ratio
+    runs to +inf, not -inf: measured +2960 dB at eps=1e-300 with a 1e-2 estimate. (An earlier version of
+    this docstring had the sign backwards; the companion isfinite assertion is what actually catches eps
+    removal, and it catches it in either direction.) Silent chunks are routine in stem training.
     """
     from torch_l1_snr import L2SNRLoss
     eps = 1e-6
@@ -655,8 +657,12 @@ def test_l2snrs_peak_gradient_matches_d1s_on_a_silent_target():
     """eps=1e-6 is the power-domain analogue of D1's amplitude-domain eps=1e-3.
 
     log(x^2 + eps) peaks in gradient at x=sqrt(eps) with value c/sqrt(eps); log(|x| + eps') peaks at
-    c/eps'. Setting eps = eps'^2 makes the two ceilings equal, so swapping norms does not silently
-    change how hard the loss pushes near convergence.
+    c/eps'. Setting eps = eps'^2 makes the two CEILINGS equal, which is all this test asserts.
+
+    It does NOT mean the two push equally near convergence -- they diverge by about 44,000x at 1e-6
+    relative error, because the L2 form's gradient peaks at relative error sqrt(tau + eps/P_y) and then
+    decays toward zero while D1's saturates and holds. That difference is the substantive one between the
+    objectives and is documented in the README; do not read this test as covering it.
     """
     from torch_l1_snr import L2SNRLoss
 
@@ -726,6 +732,37 @@ def test_the_multi_domain_time_branch_can_be_replaced_by_an_injected_module():
 
 
 @pytest.mark.no_forward
+def test_injecting_a_time_loss_warns_that_the_regularizer_is_dropped():
+    """The warning condition was inverted, so it fired exactly when nothing was lost.
+
+    `use_time_regularization` defaults to True, so at the documented A/B defaults the built-in branch
+    would have carried the adaptive level-matching regularizer and injection silently drops it. The old
+    condition was `time_loss_params is not None or NOT use_time_regularization`, which warned when the
+    user had already disabled the regularizer -- the one case where nothing disappears -- and stayed
+    silent on the default path, while the docstring claimed "a warning says so". The term is worth about
+    8.8 dB at partial collapse, i.e. it matters precisely in the regime it exists to catch.
+
+    Matching on "regularizer" rather than "time_loss_module": both construction warnings contain the
+    parameter name, so that pattern cannot tell them apart.
+    """
+    from torch_l1_snr import L2SNRLoss
+
+    # Defaults: the regularizer would have been active, so dropping it must be announced.
+    with pytest.warns(UserWarning, match="regularizer"):
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"))
+
+    # Explicitly off: the built-in branch would not have had one either, so nothing is lost on that
+    # account and there must be no regularizer warning.
+    import warnings as _w
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), use_time_regularization=False)
+    assert not [c for c in caught if "regularizer" in str(c.message)], (
+        "warned that the regularizer was dropped when it was already disabled, which is the inversion "
+        f"this test exists for; got {[str(c.message)[:70] for c in caught]}")
+
+
+@pytest.mark.no_forward
 def test_injecting_a_time_loss_warns_that_the_time_only_parameters_are_orphaned():
     """Only `time_loss_params` and `use_time_regularization` are time-exclusive.
 
@@ -733,15 +770,16 @@ def test_injecting_a_time_loss_warns_that_the_time_only_parameters_are_orphaned(
     working and must NOT warn -- warning on them would be noise on an ordinary call.
     """
     from torch_l1_snr import L2SNRLoss
-    with pytest.warns(UserWarning, match="time_loss_module"):
+    with pytest.warns(UserWarning, match="time_loss_params is ignored"):
         MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), time_loss_params={"weight": 2.0})
-    with pytest.warns(UserWarning, match="time_loss_module"):
-        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), use_time_regularization=False)
 
+    # use_time_regularization=False removes the only other warning source, so anything raised here is
+    # from the shared parameters -- which must stay silent.
     import warnings as _w
     with _w.catch_warnings():
         _w.simplefilter("error")
-        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), lambda0=0.5, l1snr_eps=1e-2)
+        MultiL1SNRDBLoss("m", time_loss_module=L2SNRLoss("l2"), use_time_regularization=False,
+                         lambda0=0.5, l1snr_eps=1e-2)
 
 
 @pytest.mark.no_forward
@@ -847,10 +885,14 @@ def test_injecting_a_time_loss_with_pure_l1_mode_warns_about_the_asymmetry():
         m = MultiL1SNRDBLoss("m", l1_weight=1.0, time_loss_module=L2SNRLoss("l2"))
     assert m.pure_l1_mode is True  # the asymmetry the warning exists to announce
 
+    # l1_weight=0.0 must not warn about pure-L1 mode. use_time_regularization=False removes the
+    # regularizer warning, which is the only other construction-time warning on this path -- before that
+    # warning was fixed it was silent here by accident, which made this assertion look narrower than it is.
     import warnings as _w
     with _w.catch_warnings():
         _w.simplefilter("error")
-        MultiL1SNRDBLoss("m", l1_weight=0.0, time_loss_module=L2SNRLoss("l2"))
+        MultiL1SNRDBLoss("m", l1_weight=0.0, time_loss_module=L2SNRLoss("l2"),
+                         use_time_regularization=False)
 
 
 def test_an_injected_modules_own_weight_multiplies_on_top_of_the_branch_weight():
@@ -931,7 +973,10 @@ def test_l2snr_eps_below_float16s_subnormal_floor_gives_inf_on_a_silent_target(e
     assert outbf.item() == pytest.approx(expected, abs=0.1), (
         f"bfloat16 at eps={eps:.0e} gave {outbf.item()}, expected {expected:.4f}")
 
-    # autocast promotes the reduction and the log to float32, so it survives too.
+    # NOTE: this block does NOT test autocast. mean and log10 are not autocast-cast ops, so autocast
+    # does not promote anything here, and `torch.zeros(2, 4000)` is float32 regardless -- so this measures
+    # float32 and cannot fail for an autocast reason. Kept because the float32 value is still worth
+    # pinning; replacing it with a real half-precision autocast gate is ticketed.
     with torch.autocast(device_type="cpu", dtype=torch.float16):
         silent32 = torch.zeros(2, 4000)
         out = loss_fn(silent32 + scale, silent32)

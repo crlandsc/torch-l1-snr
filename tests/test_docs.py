@@ -525,6 +525,57 @@ def test_the_readme_documents_the_three_inherent_properties():
             f"{where} must say what Inf actually becomes, not only what NaN becomes")
 
 
+@pytest.mark.no_forward  # inspects module-level lists only
+def test_every_per_class_list_in_the_suite_covers_the_public_classes():
+    """The suite keeps four separate lists of "all the loss classes", and adding a class narrows them.
+
+    This has now happened three times, each time silently:
+
+    1. `test_edge_cases.py` was added after `mutation_gate.TARGETS` was written, so its detection rate sat
+       at 28% while the gate reported 100% of the file it did cover.
+    2. `_forward_counter.CLASSES` was never updated with `L2SNRLoss`, so a dishonest `no_forward` marker on
+       the new class was invisible to the marker audit.
+    3. `test_edge_cases.ALL_CLASSES` was never updated either, so three mutations to `L2SNRLoss` -- dropping
+       `* self.weight` and dropping the validators from both `__init__` and `forward` -- survived the entire
+       numerical suite.
+
+    Fixing instances did not stop it, and fix 2 was itself ungated: restoring the old four-name `CLASSES`
+    leaves everything green and reopens that hole exactly. So this gate covers the family. A public loss
+    class must appear in every list, or be declared in that module's exclusion mapping with a reason, which
+    turns a silent narrowing into a decision someone has to write down.
+    """
+    import _forward_counter
+    import _mutation_stub
+    import test_edge_cases
+
+    public = {n for n in torch_l1_snr.__all__ if isinstance(getattr(torch_l1_snr, n), type)}
+    assert len(public) >= 5, f"expected at least 5 public loss classes, found {sorted(public)}"
+
+    registries = {
+        "_forward_counter.CLASSES": (set(_forward_counter.CLASSES), {}),
+        "_mutation_stub.CLASSES": (set(_mutation_stub.CLASSES), {}),
+        "test_docs.ALL_CLASSES": ({c.__name__ for c in ALL_CLASSES}, {}),
+        "test_edge_cases.ALL_CLASSES": (
+            {c.__name__ for c in test_edge_cases.ALL_CLASSES},
+            test_edge_cases.EXCLUDED_FROM_CROSS_CLASS_GATES,
+        ),
+    }
+
+    for where, (covered, excluded) in registries.items():
+        missing = public - covered - set(excluded)
+        assert not missing, (
+            f"{where} does not cover {sorted(missing)}. Every gate driven by this list silently stops "
+            "covering that class. Add it, or declare it in that module's exclusion mapping with a reason.")
+        stale = set(excluded) - public
+        assert not stale, (
+            f"{where}'s exclusion mapping names {sorted(stale)}, which is no longer a public class; "
+            "a stale exclusion hides a real gap behind a plausible-looking reason")
+        for name, reason in excluded.items():
+            assert isinstance(reason, str) and len(reason) > 40, (
+                f"{where} excludes {name} without a substantive reason; the reason is the whole point")
+        assert "dbrms" not in covered, f"{where} lists dbrms, which is a function, not a loss class"
+
+
 def test_no_superseded_figures_survive_in_the_documentation():
     """Specific numbers that measurement retired. Each was published, then shown wrong.
 
@@ -569,8 +620,14 @@ def test_changelog_compatibility_bounds_are_not_exceeded():
                         stated.setdefault(cls, float(m.group(1)))
     assert stated, "no compatibility bounds found in the CHANGELOG table"
 
-    src = _sub.run(["git", "-C", str(REPO), "show", "938b4f1:torch_l1_snr/l1snr.py"],
-                   capture_output=True, text=True, check=True).stdout
+    # check=False and skip: a shallow clone or a tarball has no 938b4f1, and erroring there reports a
+    # missing baseline as a failed compatibility bound. CI now fetches full history so this really runs;
+    # the skip is for anywhere that cannot. The sibling gate in test_edge_cases.py does the same.
+    _show = _sub.run(["git", "-C", str(REPO), "show", "938b4f1:torch_l1_snr/l1snr.py"],
+                     capture_output=True, text=True)
+    if _show.returncode != 0:
+        pytest.skip("cannot reach the 938b4f1 baseline from git; compatibility bounds unverifiable here")
+    src = _show.stdout
     # TemporaryDirectory, not mkdtemp: tempfile.gettempdir() falls back to os.getcwd() when every
     # standard candidate fails its writability probe, which happens under a sandboxed or locked-down
     # /tmp. mkdtemp then leaves a directory in the repo root on every run. Where it lands is the

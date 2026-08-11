@@ -27,6 +27,19 @@ from torch_l1_snr import (
 
 ALL_CLASSES = [L1SNRLoss, L1SNRDBLoss, STFTL1SNRDBLoss, MultiL1SNRDBLoss]
 
+# Public loss classes deliberately NOT in ALL_CLASSES, with the reason. Declaring them is not paperwork:
+# test_docs.py::test_every_per_class_list_in_the_suite_covers_the_public_classes fails on a public class
+# that is neither covered nor listed here, so adding a loss forces a decision instead of silently
+# narrowing every cross-class gate in this file. That silent narrowing has happened three times.
+EXCLUDED_FROM_CROSS_CLASS_GATES = {
+    "L2SNRLoss": (
+        "The ~21 parametrized gates below assume an l1_weight parameter, which L2SNRLoss does not have "
+        "(it is a pure energy ratio with no L1 blend). Adding it here would error at collection rather "
+        "than test anything. Its equivalents are pinned as targeted tests in test_losses.py instead, "
+        "each verified against the mutation it exists to catch."
+    ),
+}
+
 
 def audio(*shape, level=0.05, seed=0):
     g = torch.Generator().manual_seed(seed)

@@ -332,7 +332,8 @@ class L2SNRLoss(torch.nn.Module):
       L2SNR_loss = mean(D2)
 
     Note the parentheses: every term is a mean OF SQUARES, not a square of a mean. Reading
-    `mean(y)^2` literally gives roughly zero for zero-mean audio and a value about 18 dB off.
+    `mean(y)^2` literally gives roughly zero for zero-mean audio, and the resulting error is large and
+    level-dependent: measured 33.4 dB off at amplitude 0.05 and 52.9 dB at amplitude 0.5.
 
     This is the tau-clamped SNR of the universal-sound-separation literature, written as a ratio so it
     matches L1SNRLoss's shape. It exists because uSDR is an energy ratio, so an energy-ratio loss is the
@@ -370,16 +371,26 @@ class L2SNRLoss(torch.nn.Module):
     large to use as a floor here, so there is no fully float16-safe setting.
 
     bfloat16 is unaffected: it trades mantissa for exponent (8 mantissa bits against float16's 11, but
-    float32's exponent range), so it represents 1e-8 exactly while being *less* precise per digit. That
-    trade is why the wider-range format is the safe one here. `torch.autocast` is also fine on both,
-    because it promotes the reduction and the log to float32 -- measured, the returned dtype is float32
-    and the silent case gives 0.0004 rather than inf. Gated in tests/test_losses.py.
+    float32's exponent range), so 1e-8 does not underflow, while being *less* precise per digit. No binary
+    float represents 1e-8 exactly -- bfloat16 stores 1.0012e-08 -- but it does not round to zero. That
+    trade is why the wider-range format is the safe one here. `torch.autocast` does NOT rescue float16:
+    mean and log10 are not autocast-cast ops, so the computation stays in the input dtype (measured:
+    float16 in, float16 out, under autocast(float16)). A typical mixed-precision loop survives through
+    ordinary promotion in `estimates - actuals` when one side is float32, not through autocast.
 
     **This loss reports about TWICE the decibels D1 does for the same estimate, and that is not a bug
     in either.** D1 takes 10*log10 of an AMPLITUDE ratio (mean|e| / mean|y|), which is the authors'
     bandit convention and is preserved here bit-exactly; a power ratio in decibels is 10*log10, so
-    L2SNRLoss reports 20*log10 of the equivalent amplitude ratio. Measured on Gaussian error, the ratio
-    of the two losses is 1.9x to 2.1x across relative errors from 0.003 to 0.5.
+    L2SNRLoss reports 20*log10 of the equivalent amplitude ratio. The ratio of the two losses is NOT a
+    fixed 2x: measured 1.26x to 2.13x at the defaults, falling as the estimate converges and as the
+    target gets louder (2.13x at 10% relative error on amplitude 0.05; 1.26x at 0.3% on amplitude 1.0).
+
+    Error shape moves it independently. At fixed error ENERGY this loss is shape-blind, because it only
+    sees RMS, while D1 reports a better score as the error becomes impulsive, because mean|e| falls at
+    constant RMS. Measured at 10% relative error: Gaussian gives D1 -9.14 / D2 -19.43 (2.13x), error
+    confined to 0.1% of samples gives D1 -15.59 / D2 -19.58 (1.26x). D2 moved 0.15 dB, D1 moved 6.5 dB.
+    Since uSDR is an energy ratio, that shape-blindness -- not the decibel scale -- is the substantive
+    reason to prefer this form.
 
     The consequence is not cosmetic when this is used as `MultiL1SNRDBLoss(time_loss_module=...)`.
     That class combines its branches as `(1 - spec_weight) * time + spec_weight * spec`, so doubling
@@ -1452,12 +1463,27 @@ class MultiL1SNRDBLoss(torch.nn.Module):
             # Only these two are time-exclusive. lambda0, delta_lambda, l1snr_eps, dbrms_eps, lmin,
             # l1_weight and ref_level are shared with the spectrogram branch and keep working, so warning
             # on them would fire on ordinary calls.
-            if time_loss_params is not None or not use_time_regularization:
+            # Say only what is actually lost. The condition here used to be `not use_time_regularization`,
+            # which warned when the user had ALREADY disabled the regularizer -- the one case where nothing
+            # disappears -- and stayed silent at the defaults, where the anti-collapse term genuinely goes
+            # away. A blanket message naming both parameters also cannot be gated apart from the
+            # l1_weight warning below, since both contain the string "time_loss_module".
+            orphaned = []
+            if use_time_regularization:
+                orphaned.append(
+                    "the adaptive level-matching regularizer is dropped, because an injected module "
+                    "brings its own objective (worth about 8.8 dB at partial collapse, so this matters "
+                    "in exactly the regime the term exists to catch)"
+                )
+            if time_loss_params is not None:
+                orphaned.append("time_loss_params is ignored")
+            if orphaned:
                 warnings.warn(
-                    "time_loss_module replaces the built-in time-domain loss, so time_loss_params and "
-                    "use_time_regularization no longer have any effect. Parameters shared with the "
-                    "spectrogram branch (lambda0, delta_lambda, l1snr_eps, dbrms_eps, lmin, l1_weight, "
-                    "ref_level) still apply, but now reach only that branch.",
+                    "time_loss_module replaces the built-in time-domain loss, so "
+                    + "; and ".join(orphaned)
+                    + ". Parameters shared with the spectrogram branch (lambda0, delta_lambda, "
+                    "l1snr_eps, dbrms_eps, lmin, l1_weight, ref_level) still apply, but now reach only "
+                    "that branch.",
                     UserWarning,
                     stacklevel=2,
                 )
