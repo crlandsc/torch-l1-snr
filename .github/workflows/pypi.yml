@@ -2,13 +2,102 @@ name: Publish Python 🐍 distribution 📦 to PyPI
 
 on:
   push:
+    branches:
+      - main
+      - "release/**"
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
+
+# Avoid duplicate runs when a release/** branch also has an open PR. Never cancel a tag run: that is the
+# only ref that can publish, and interrupting it mid-flight is not something to risk for saved CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   test:
-    name: Run tests 🧪
+    name: Run tests 🧪 (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          # The suite reads git history: two gates compare signatures against the 0.1.3 and 0.1.4 trees,
+          # and one measures the compatibility bounds against the pre-audit baseline 938b4f1. checkout
+          # defaults to a depth-1 clone, so those commits do not exist on the runner -- which failed CI
+          # with `git show ... exit 128` while every one of them passed locally. Full history makes them
+          # actually run here rather than skip.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest coverage
+
+      - name: Run tests
+        run: pytest tests/
+
+      # Validation must survive python -O, which strips bare `assert`. Kept as its own step so a
+      # regression here is legible rather than hidden inside the main run.
+      - name: Run tests with assertions disabled
+        run: python -O -m pytest tests/
+
+      # Audit finding M2: before the rebuild, 122 of 127 tests passed against a library whose four forward()
+      # methods returned a constant. This step stubs them and requires every test that exercises a forward()
+      # to notice. Tests that legitimately do not carry the no_forward marker.
+      - name: Mutation gate (suite must be able to detect a constant loss)
+        run: python tests/mutation_gate.py
+
+      # The no_forward marker excludes a test from the ratio above, so an untrue marker is a hole in the
+      # gate. This counts actual forward() calls and fails if any marked test makes one.
+      - name: Mutation gate marker audit
+        run: python tests/mutation_gate.py --audit-markers
+
+      # PEP 561: without py.typed, no type hint in this package reaches a downstream checker, and the
+      # marker only matters if it actually ships. Checked by building a wheel and looking inside, rather
+      # than by asserting the file exists in the source tree.
+      #
+      # A fuller check -- installing the wheel somewhere clean and running mypy on a consumer snippet -- was
+      # attempted and abandoned: the test job installs the package editable, and mypy cannot resolve an
+      # editable install from outside the source tree, so the check passed or failed for reasons unrelated
+      # to py.typed. Verifying the wheel contents tests the mechanism without that confound.
+      - name: py.typed ships in the wheel
+        run: |
+          pip install build
+          python -m build --wheel --outdir /tmp/whl
+          python - <<'PY'
+          import glob, zipfile, sys
+          names = zipfile.ZipFile(glob.glob("/tmp/whl/*.whl")[0]).namelist()
+          if not any(n.endswith("torch_l1_snr/py.typed") for n in names):
+              sys.exit("py.typed is missing from the built wheel; type hints will not reach consumers")
+          if any(n.startswith("tests") for n in names):
+              sys.exit("the tests package leaked into the wheel")
+          print("wheel contains py.typed and excludes tests")
+          PY
+
+      - name: Coverage gate
+        env:
+          PYTHONPATH: tests
+        run: |
+          coverage run --source=torch_l1_snr -m pytest tests/ -q
+          coverage report -m --fail-under=90
+
+  version-check:
+    name: Tag matches __version__ 🏷️
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     steps:
@@ -16,23 +105,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Install dependencies
+      - name: Compare tag against __version__
         run: |
-          python -m pip install --upgrade pip
-          pip install -e .
-          pip install pytest
-
-      - name: Run tests
-        run: pytest tests/
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(python -c "import re;print(re.search(r'__version__ = \"([^\"]+)\"', open('torch_l1_snr/__init__.py').read()).group(1))")
+          echo "tag=$TAG  __version__=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG does not match __version__ $PKG"
+            exit 1
+          fi
 
   build:
     name: Build distribution 📦
-    needs: test
+    needs: [test, version-check]
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     steps:
@@ -62,6 +148,7 @@ jobs:
   publish-to-pypi:
     name: Publish Python 🐍 distribution 📦 to PyPI
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
 
     environment:
