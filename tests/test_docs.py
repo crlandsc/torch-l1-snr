@@ -452,17 +452,21 @@ def test_the_changelog_does_not_advertise_the_reverted_device_guard():
             "the device move is discussed before the did-not-ship list, which reads as a shipped change")
 
 
-def test_the_changelog_has_exactly_one_unreleased_entry():
-    """0.1.4 was prepared as a separate release and then folded into 0.2.0, since nothing past 0.1.3 shipped.
+def test_the_changelog_tops_out_at_a_dated_0_2_0_with_no_stray_unreleased():
+    """0.2.0 is the release, and 0.1.4 was folded into it since nothing past 0.1.3 ever shipped.
 
-    A leftover `## 0.1.4` section would describe a version nobody can install, and would split the upgrade
-    story for the only upgrade that exists: 0.1.3 to 0.2.0. It would also strand that section's own claim
-    that all four signatures match 0.1.3 exactly, which is true of the abandoned tree and false of 0.2.0.
+    The top entry must be `## 0.2.0 (YYYY-MM-DD)` -- dated, not `(unreleased)`, because a tag is imminent and
+    the CI tag gate checks __version__ against the tag. No `(unreleased)` marker may linger anywhere. A
+    leftover `## 0.1.4` section would describe a version nobody can install and split the only upgrade story
+    there is (0.1.3 to 0.2.0), and would strand that section's own claim that all four signatures match 0.1.3
+    exactly -- true of the abandoned tree, false of 0.2.0.
     """
-    unreleased = re.findall(r"^## (\S+) \(unreleased\)", CHANGELOG, re.MULTILINE)
-    assert unreleased == ["0.2.0"], (
-        f"expected exactly one unreleased entry for 0.2.0, found {unreleased}; every change since 0.1.3 "
-        "belongs in the single entry a 0.1.3 user will read")
+    top = re.search(r"^## (\S+) \(([^)]+)\)", CHANGELOG, re.MULTILINE)
+    assert top and top.group(1) == "0.2.0", f"the top changelog entry is not 0.2.0: {top and top.group(1)}"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", top.group(2)), (
+        f"0.2.0 is dated {top.group(2)!r}, expected an ISO date; strip '(unreleased)' before tagging")
+    assert "(unreleased)" not in CHANGELOG, (
+        "a stray '(unreleased)' marker remains; every entry that ships must carry a real date")
     assert not re.search(r"^## 0\.1\.4", CHANGELOG, re.MULTILINE), (
         "there is a 0.1.4 section; that version was never published and 0.2.0 contains all of its content")
     assert "signature change in this release. All four constructor signatures are identical to 0.1.3" \
