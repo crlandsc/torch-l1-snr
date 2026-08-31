@@ -68,7 +68,7 @@ pip install -e .
 
 ## Supported Tensor Shapes
 
-All loss functions in this package (`L1SNRLoss`, `L2SNRLoss`, `L1SNRDBLoss`, `STFTL1SNRDBLoss`, and `MultiL1SNRDBLoss`) accept standard audio tensors of shape `(batch, samples)`, `(batch, channels, samples)`, or `(batch, num_sources, channels, samples)`. For the time-domain losses, any 3D/4D input is flattened across all non-batch dimensions (e.g., sources, channels, and samples) into a single vector per example before the loss is computed. For the spectrogram-domain loss, inputs are reshaped to `(batch, streams, samples)` by flattening all non-time dimensions into a “stream” dimension (e.g., `streams = channels` or `streams = num_sources * channels`), and a separate STFT is computed for each stream.
+All loss functions in this package (`L1SNRLoss`, `L1SNRDBLoss`, `STFTL1SNRDBLoss`, and `MultiL1SNRDBLoss`) accept standard audio tensors of shape `(batch, samples)`, `(batch, channels, samples)`, or `(batch, num_sources, channels, samples)`. For the time-domain losses, any 3D/4D input is flattened across all non-batch dimensions (e.g., sources, channels, and samples) into a single vector per example before the loss is computed. For the spectrogram-domain loss, inputs are reshaped to `(batch, streams, samples)` by flattening all non-time dimensions into a “stream” dimension (e.g., `streams = channels` or `streams = num_sources * channels`), and a separate STFT is computed for each stream.
 
 ## Usage
 
@@ -95,49 +95,6 @@ loss.backward()
 
 print(f"L1SNRLoss: {loss.item()}")
 ```
-
-### `L2SNRLoss` (Time Domain, Energy Ratio, Experimental)
-
-Energy-ratio sibling of `L1SNRLoss`, computing `10*log10((mean(e²) + tau*mean(y²) + eps) / (mean(y²) + eps))`. Where `L1SNRLoss` measures mean-absolute error, this measures error **energy**, which is what SDR measures. It is the tau-clamped SNR of the universal sound separation literature.
-
-**This is an opt-in experiment, not a recommendation.** Nothing selects it by default and no other loss changes because it exists. The theoretical case for matching the metric's norm is real, but published music-separation results point the other way: both [Demucs](https://arxiv.org/abs/1911.13254) and [HS-TasNet](https://arxiv.org/abs/2402.17701) chose L1 over SI-SNR/SD-SDR for this task after finding the metric-matched losses converged more slowly and scored worse. It is provided so that comparison can be run rather than argued.
-
-```python
-import torch
-from torch_l1_snr import L2SNRLoss
-
-estimates = torch.randn(4, 2, 44100, requires_grad=True)
-actuals = torch.randn(4, 2, 44100)
-
-# tau caps the attainable SNR at -10*log10(tau) dB; the default 1e-3 gives a 30 dB cap
-loss_fn = L2SNRLoss(name="l2_snr_loss", tau=1e-3)
-
-loss = loss_fn(estimates, actuals)
-loss.backward()
-
-print(f"L2SNRLoss: {loss.item()}")
-```
-
-Two floors, both needed. `tau` is relative to the target and bounds the gradient growth as a source converges. `eps` is absolute and is what keeps a **silent** target finite: `tau*mean(y²)` is zero when the target is zero, so `tau` alone would leave the loss unbounded on exactly the silent chunks that are common in stem training.
-
-**Both floors are level-dependent, because the effective floor is whichever dominates (`tau*mean(y²) + eps`).** Two consequences worth knowing before you read a loss curve:
-
-- The **30 dB cap holds only above about -30 dBFS RMS** (`mean(y²) >> eps/tau`). Below that `eps` takes over and the best attainable value rises: -29.6 dB at -20 dBFS, -19.6 dB at -40 dBFS, -3.0 dB at -60 dBFS. `L1SNRLoss` has the same level-dependence, documented under Limitations.
-- The **gradient ceiling is `c/sqrt(tau*mean(y²) + eps)`**: 4343 on a silent target, about 136 at 0 dBFS. `L1SNRLoss`'s ceiling is 4343 regardless of level, so the two agree at silence and diverge by up to ~32x on loud targets. The `eps` default of `1e-6` is the power-domain analogue of `L1SNRLoss`'s amplitude-domain `1e-3`, which is what makes the **silent-target** ceilings match. It does not make them match everywhere.
-
-**Do not run this loss in pure `float16`, and do not lower `eps` below `1e-6` if you might.** float16's smallest subnormal is `5.96e-08`, so `eps=1e-8` rounds to exactly zero; with a silent target the numerator and denominator then both collapse and the loss returns **`+inf`**, killing the run. The `1e-6` default survives but only as a float16 subnormal (`1.013e-06`), so hardware that flushes subnormals to zero would break it too, and float16's smallest *normal* value (`6.1e-05`) is far too large to use as a floor. There is no fully float16-safe setting.
-
-`bfloat16` is unaffected, and the reason is worth knowing: it trades mantissa for exponent (8 mantissa bits against float16's 11, but float32's exponent range), so `1e-8` does not underflow while being *less* precise per digit (no binary float represents `1e-8` exactly -- bfloat16 stores it as `1.0012e-08`, float32 as `9.99999994e-09`; what matters is that neither rounds it to zero). **`torch.autocast` does not rescue this.** `mean` and `log10` are not autocast-cast operations, so under autocast the computation stays in the input dtype: measured, float16 input under `autocast(float16)` returns a float16 result, not a promoted float32 one. What actually saves a typical mixed-precision loop is ordinary dtype promotion in `estimates - actuals` when one side is float32. If both sides are float16, autocast does not help. Measured accuracy against a float64 reference at 10% error: float32 exact, bfloat16 0.028 dB at `eps=1e-6` and 0.0006 dB at `eps=1e-8`.
-
-Because a silent target can score anywhere from 0 to +60 dB while a normal one sits near -20 dB, a single silent row pulls a batch mean up hard: one silent row in four moved a measured batch mean from -19.3 to -10.9 dB. `tau=0` is accepted and removes the relative floor entirely, leaving `eps` alone.
-
-**It reports about twice the decibels `L1SNRLoss` does for the same estimate, and neither is wrong.** `L1SNRLoss` takes `10*log10` of an *amplitude* ratio (the authors' bandit convention, preserved bit-exactly); a power ratio in decibels is `10*log10`, so this is effectively `20*log10` of the equivalent amplitude ratio. Measured ratio at the defaults: **1.26x to 2.13x**, not a fixed 2x. It approaches 2x only for Gaussian error on a quiet target far from convergence, and falls as the model improves (2.13x at 10% relative error on a 0.05-amplitude target, 1.26x at 0.3% on a unit-amplitude one).
-
-**Error *shape* moves it independently, and this is the more interesting half.** At fixed error energy, `L2SNRLoss` is shape-blind because it only sees RMS, while `L1SNRLoss` reports a *better* score as the error becomes impulsive, because `mean|e|` falls at constant RMS. Measured at 10% relative error: Gaussian error gives D1 -9.14 and D2 -19.43 (ratio 2.13), while error confined to 0.1% of samples gives D1 -15.59 and D2 -19.58 (ratio 1.26) -- D2 barely moved, D1 improved by 6.5 dB for the same energy. Since uSDR is itself an energy ratio, that shape-blindness is the substantive argument for this loss, rather than the decibel scale.
-
-That matters when you use it as `time_loss_module`. `MultiL1SNRDBLoss` combines its branches as `(1 - spec_weight) * time + spec_weight * spec`, so a time term of twice the magnitude takes twice the share of the objective at the same `spec_weight`: measured at `spec_weight=0.5` and 10% error, `|time| / |spectral|` goes from **0.518** with `L1SNRLoss` to **1.101** with this one. **A two-arm A/B that swaps only the time loss varies the norm and the domain balance together.** Sweep `spec_weight` in the L2 arm, or raise it to roughly **0.68** to restore the L1 arm's balance.
-
-To A/B it against `L1SNRDBLoss` inside the multi-domain loss, pass it as `MultiL1SNRDBLoss(time_loss_module=L2SNRLoss('time'))`. Note that doing so drops the time-domain regularizer and shifts the domain balance, both of which the constructor warns about -- so prefer comparing the two losses **standalone**, which isolates the norm and avoids both effects.
 
 ### `L1SNRDBLoss` (Time Domain with Regularization)
 
@@ -270,45 +227,9 @@ So I recommend starting with no standard L1 mixed in (`l1_weight=0.0`), and then
 -   `l1_weight=1.0`: Pure standard L1 loss.
 -   `0.0 < l1_weight < 1.0`: A weighted combination of the two.
 
-#### `l1_weight` is an interpolation coefficient, not a behaviour fraction
+The implementation is efficient at the endpoints: if `l1_weight` is `0.0` or `1.0`, the unused component is not computed.
 
-`l1_weight=0.1` does **not** mean "10% L1 behaviour". Both terms push the gradient in the same direction, so what the knob actually controls is how strongly each sample's update is scaled by its own error magnitude: L1SNR scales inversely with error, L1 does not. Measuring how far that scaling has moved from pure L1SNR toward pure L1:
-
-| `l1_weight` | 0.1 | 0.3 | 0.5 | 0.7 | 0.9 |
-|---|---|---|---|---|---|
-| targets at `mean\|y\| ~ 0.05`, i.e. at `ref_level` | **1.1%** | **4.1%** | **9.0%** | 18.7% | 47.1% |
-| targets at `mean\|y\| ~ 0.2`, 4x above `ref_level` | 3.6% | 12.5% | 25.0% | 43.8% | 75.0% |
-| targets at `mean\|y\| ~ 0.5`, 10x above `ref_level` | 8.2% | 25.6% | 44.6% | 65.2% | 87.9% |
-
-So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch. Earlier versions of this README stated these as flat percentages matching the parameter value, which was wrong in both directions depending on the data.
-
-**What determines which row applies to you is your target level relative to `ref_level`, not how much your levels vary within a batch.** Level spread turns out to make almost no difference: a batch at `mean|y| ~ 0.05` gives 9.0% at `l1_weight=0.5` whether it is uniform or spans 40 dB. What matters is the level of the *loudest* stem in the batch, since that is what sets the gradient profile the metric measures.
-
-For MUSDB-style stems at the default `ref_level=0.05`, expect somewhere between the first two rows. The measured median stem level is 0.053, but the 99th percentile is 0.116, a little over 2x `ref_level`, and a batch containing one such stem lands near 20% rather than 9%. Read the first row as a floor and the second as a typical case.
-
-Two practical consequences. Starting at `l1_weight=0.1` introduces far less L1 character than the number suggests -- roughly 1-3% for MUSDB-style data -- so if the knob seems to do nothing, try substantially larger values before concluding the feature does not help. And the effect differs between domains: at `l1_weight=0.5` with targets at `ref_level`, the time-domain component moves about 9% toward L1 while the spectrogram component moves further, because the spectrogram operates at a lower reference magnitude relative to the shared epsilon. In `MultiL1SNRDBLoss` the single `l1_weight` therefore means somewhat different things in its two halves.
-
-#### `ref_level`: what the L1 term is scaled against
-
-When blending, the L1 term is scaled to be comparable with a decibel quantity, using `ref_level` (default `0.05`) as the assumed typical mean-absolute amplitude of your targets. That default is the measured median for MUSDB-style stems.
-
-Before v0.2.0 this scale was computed per batch as a mean of reciprocals, which had two problems: one quiet target inflated the gradient for every other sample in the batch, and the knob's meaning drifted with batch content. Batch-to-batch spread in the figures above was 49.7 points at `l1_weight=0.1` and 75.4 at `0.5`; it is now 4.7 and 19.7.
-
-To set it for your own data, measure the mean absolute value of your targets over a few batches and pass that. Being off by 2x moves the knob roughly 5 points; being off by 10x matters. `ref_level` also works as a deliberate calibration handle, since it shifts the whole curve:
-
-| `ref_level` | 1.0 | 0.2 | **0.05** | 0.0125 | 0.005 |
-|---|---|---|---|---|---|
-| toward L1 at `l1_weight=0.5`, targets at `mean\|y\| ~ 0.05` | 0.5% | 2.4% | **9.0%** | 27.2% | 45.7% |
-
-The spectrogram domain uses `spec_ref_level`, which defaults to `0.19 * ref_level`. That ratio is measured: across 496 real stem excerpts the normalized-STFT reference magnitude is about 5.6x below the time-domain one. Setting `spec_ref_level` equal to `ref_level` would be roughly 5x too large and cost about 20 points of knob position at `l1_weight=0.5`, so prefer leaving it derived unless you have measured your own.
-
-The implementation is optimized for efficiency: if `l1_weight` is `0.0` or `1.0`, the unused loss component is not computed, saving computational resources.
-
-**Note on Gradient Balancing:** When blending losses (`0.0 < l1_weight < 1.0`), the implementation scales the L1 component by the reference signal magnitude rather than the error magnitude. The purpose is to keep the two components' gradient *profiles* distinct: L1SNR produces inverse-error-scaled gradients while L1 produces uniform ones, and scaling by the error would collapse the second into the first (this was the v0.1.2 bugfix).
-
-The scaling brings the two components to a comparable magnitude near 0 dB SNR, but it does not equalize them across the range, and it is not intended to. The L1 term's gradient magnitude is independent of the error, while L1SNR's grows as the error shrinks, so the ratio between them necessarily widens as the model improves. Measured on a single 8192-sample target with `ref_level=0.05`, the D1-to-L1 gradient-norm ratio is about 1.0 at 0 dB SNR, 8.5 at 20 dB, 34 at 40 dB and 49 at 60 dB when the target's `mean|y|` is exactly 0.05. Those figures shift by 20-25% with the target level -- at `mean|y| = 0.04` they are 1.25, 10.2, 36.5 and 49.0 -- so read them as the shape of the trend, not as constants.
-
-Those particular numbers depend on the target level and on how `ref_level` is set, so treat them as an illustration of the trend rather than constants. The point to take away is that `l1_weight` is an interpolation coefficient to tune, not a guaranteed balance between the two terms.
+`l1_weight` is an interpolation coefficient, not a behaviour fraction: `l1_weight=0.1` does **not** mean "10% L1 behaviour". How far the knob moves each update toward L1 depends on your target level relative to `ref_level` (default `0.05`, the measured median for MUSDB-style stems), and it differs between the time and spectrogram domains. See [docs/design_notes.md](docs/design_notes.md) for the measured tables, the `ref_level` / `spec_ref_level` calibration, and the per-domain difference.
 
 ## Device Compatibility
 
@@ -329,10 +250,7 @@ loss_fn = STFTL1SNRDBLoss(name="stft_loss", mps_cpu_fallback=False)
 - While the dB scaling and regularization are psychoacoustically motivated, the loss does not model more complex perceptual phenomena like auditory masking.
 - **The usable dynamic range collapses for quiet targets.** Because `eps` sits in both the numerator and denominator, D1's floor at perfect reconstruction is `10*log10(eps / (mean|y| + eps))` rather than negative infinity. With the default `eps=1e-3` that floor is roughly -30 dB at `mean|y|=1`, -20 dB at 0.1, -10 dB at 0.01, and only -3 dB at 1e-3. A target near -58 dBFS RMS therefore has under 3 dB of total loss range to optimize within. This is inherited from the reference implementation rather than introduced here, but it means very quiet stems carry correspondingly little gradient signal, and it is worth checking your target levels before attributing poor performance on quiet sources to the model. The papers note the same constraint, that the loss is numerically stable for `eps` *not* much smaller than the signal norm.
 - **`spec_weight` is a loss-value weight, not a gradient share.** In `MultiL1SNRDBLoss` the combination is `(1 - spec_weight) * time_loss + spec_weight * spec_loss`, so the coefficients are exactly as documented. But `spec_loss` internally sums a real and an imaginary D1 term while `time_loss` is a single term, so equal coefficients do not mean the two domains contribute equally to the gradient. The default `0.5` is chosen for a specific reason: it is the value at which the time, real and imaginary terms all receive weight 0.5, reproducing the equal 1:1:1 weighting of the objective in [[3]](https://arxiv.org/abs/2406.18747). Prefer to leave it there unless you have a reason to shift domain emphasis.
-- **`STFTL1SNRDBLoss` alone is not monotone in reconstruction quality.** Measured on `[4, 2, 44100]` stems at amplitude 0.05: a DC offset equal to the signal amplitude scores **-23.6 dB** while 10% white noise scores **-17.6 dB**, even though the time-domain D1 rates the DC error about 10 dB *worse* (+0.96 against -9.13). Two independent mechanisms, both properties of applying a mean-reduced D1 to spectrogram components rather than defects in this code. First, a real-valued error is almost invisible to the imaginary term: for the DC offset, `mean|err_im|` is 4.9e-09 against `mean|err_re|` of 2.7e-03, six orders of magnitude apart, so a near-purely-real error gets a near-free pass on half the objective. Note that `l1snr_eps` *limits* this rather than causing it, by flooring how large the free pass can be: at `l1snr_eps=0` the same comparison widens from 5.9 dB to 57.8 dB. Second, the mean over frequency bins dilutes a spectrally concentrated error: 66.7% of the DC error's magnitude sits in a single one of 1025 bins. The second mechanism survives reformulating the loss on the complex modulus instead of on Re and Im separately, so that is not a fix. Practically: do not use a bare `STFTL1SNRDBLoss` where a systematic offset or a strongly tonal error is plausible, and do not read the spectral term of a `MultiL1SNRDBLoss` run as a standalone quality metric. `MultiL1SNRDBLoss` at the default `spec_weight=0.5` orders both pairs correctly, because the time-domain term carries enough weight to dominate, which is one reason it is the recommended entry point.
-- **`L2SNRLoss` overflows in float32 sooner than the L1 losses.** It reduces `mean(e**2)`, which squares before summing, so at 44100 samples per row the accumulator overflows around `|x| ~ 8.8e16` and the loss becomes `+inf` (measured: 364.8 at 8.7e16, `inf` at 8.8e16). `NaN` needs the *target* to overflow as well, which a diverging estimate against a fixed target does not cause. `L1SNRLoss` reduces `mean|e|` and survives past 1e30. Same mechanism as the `dbrms` bullet below, reachable only on a run already diverging through 1e16, and loud rather than silent. float64 is unaffected.
-- **`dbrms` overflows in float32 well below float32's range.** `mean(x**2)` squares before reducing, so the sum overflows once `|x|` reaches roughly 2.5e16 at a realistic `[8, 2, 264600]` shape (2.0e17 at 8192 elements per row) — far below the 3.4e38 the dtype can hold. The inputs are still finite, so `check_finite` cannot catch it, and the loss becomes `inf`, or `NaN` once both levels overflow and the regularizer computes `|inf - inf|`. This is only reachable on a run already diverging through 1e16, and `inf`/`NaN` is loud rather than silent, which is why the numerics are left alone. float64 is unaffected.
-- **The level-matching regularizer exerts no force at exactly digital silence.** `d/dx sqrt(mean(x²) + eps)` is exactly zero at `x ≡ 0`, so the term that exists to penalize collapse contributes no gradient precisely *at* the collapse point; it becomes meaningful around 1e-4. The D1 term still supplies gradient there, so a model is not stuck — the total gradient at exact silence is nonzero — but if you use a mask-based separator whose mask saturates to exactly 0, the escape pressure comes from D1 rather than from the regularizer.
+- **Finer numerical behaviours are documented separately.** The spectrogram loss is not strictly monotone in reconstruction quality, the squared reductions overflow in float32 far below the dtype's range, and the level-matching regularizer exerts no gradient at exactly digital silence. See [docs/design_notes.md](docs/design_notes.md) for measured detail on each.
 
 ## Contributing
 

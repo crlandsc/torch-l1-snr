@@ -30,6 +30,7 @@ from torch_l1_snr import (
 README = (REPO / "README.md").read_text()
 CHANGELOG = (REPO / "CHANGELOG.md").read_text()
 SOURCE = (REPO / "torch_l1_snr" / "l1snr.py").read_text()
+DESIGN_NOTES = (REPO / "docs" / "design_notes.md").read_text()
 LICENSE = (REPO / "LICENSE").read_text()
 SETUP_CFG = (REPO / "setup.cfg").read_text()
 
@@ -43,7 +44,7 @@ PUBLISHED_VERSIONS = ["0.0.1", "0.0.2", "0.0.3", "0.0.4", "0.0.5",
 # The README is known to contain this many runnable python examples. Pinned so the gates below cannot
 # silently evaporate: they are parametrized over the discovered blocks, so if the fence syntax changed and
 # the regex stopped matching, pytest would collect zero cases and report success rather than failure.
-EXPECTED_README_EXAMPLES = 7
+EXPECTED_README_EXAMPLES = 6
 
 
 def readme_python_blocks():
@@ -258,18 +259,23 @@ def test_no_proportional_l1_weight_claims():
         "README does not state what l1_weight actually is")
 
 
-def test_readme_documents_ref_level_and_its_derivation():
-    """A14 introduced two parameters whose defaults rest on measurements; both must be explained."""
-    assert "ref_level" in README
-    assert "spec_ref_level" in README
-    assert "0.19" in README, "the measured STFT-to-time reference ratio is not stated"
+def test_design_notes_document_ref_level_and_its_derivation():
+    """A14 introduced two parameters whose defaults rest on measurements; both must be explained.
+
+    Moved out of the README (kept concise there) into docs/design-notes.md, so the measured derivation is
+    gated where it now lives."""
+    assert "ref_level" in DESIGN_NOTES
+    assert "spec_ref_level" in DESIGN_NOTES
+    assert "0.19" in DESIGN_NOTES, "the measured STFT-to-time reference ratio is not stated"
+    # the README still has to name ref_level, since a user sets it
+    assert "ref_level" in README, "the README no longer mentions ref_level at all"
 
 
-def test_readme_states_the_per_domain_difference():
+def test_design_notes_state_the_per_domain_difference():
     """M23: at l1_weight=0.5 the time domain moves ~25% toward L1 and the spectrogram ~45%, so the single
-    knob means different things in the two halves of MultiL1SNRDBLoss."""
-    assert "different things in its two halves" in README or "two halves" in README, (
-        "README does not state that l1_weight's effect differs by domain")
+    knob means different things in the two halves of MultiL1SNRDBLoss. Now in docs/design-notes.md."""
+    assert "different things in its two halves" in DESIGN_NOTES or "two halves" in DESIGN_NOTES, (
+        "design-notes does not state that l1_weight's effect differs by domain")
 
 
 def test_no_unscoped_gradient_matching_claim():
@@ -311,10 +317,20 @@ def test_limitations_documents_level_dependent_floor():
     )
 
 
-def test_public_api_is_documented_in_readme():
-    """Q24: dbrms is exported in __all__ but documented nowhere."""
-    missing = [n for n in torch_l1_snr.__all__ if n not in README]
+# L2SNRLoss ships deliberately quiet: importable, with a full docstring, but referenced in no prose doc so
+# it is not advertised as a feature while it is still experimental. This set locks that intent -- both that
+# it stays out of the prose, and that it can only leave this set by a deliberate edit here.
+QUIET_UNDOCUMENTED = {"L2SNRLoss"}
+
+
+def test_public_api_is_documented_in_readme_except_the_quiet_ones():
+    """Q24: dbrms was exported in __all__ but documented nowhere. Every public name must be in the README
+    except the deliberately-quiet experimental ones, which must be ABSENT from every prose doc."""
+    missing = [n for n in torch_l1_snr.__all__ if n not in README and n not in QUIET_UNDOCUMENTED]
     assert not missing, f"exported but undocumented in README: {missing}"
+    for n in QUIET_UNDOCUMENTED:
+        assert n not in README, f"{n} is meant to ship quiet but appears in the README"
+        assert n not in DESIGN_NOTES, f"{n} is meant to ship quiet but appears in docs/design-notes.md"
 
 
 # --------------------------------------------------------------------------------------
@@ -495,14 +511,15 @@ def test_the_changelog_states_positional_compatibility_as_a_guarantee():
         "are identical to 0.1.3's")
 
 
-def test_the_readme_documents_the_three_inherent_properties():
+def test_the_design_notes_document_the_three_inherent_properties():
     """Three behaviours a user can hit that no amount of reading the previous text would predict.
 
     Each is gated behaviourally in test_edge_cases as well; this checks the user-facing half exists, because a
     property that is true, tested, and undocumented still surprises the person it happens to. Requirements
-    rather than sentences: the Limitations section must name the quantity and give the reader a number.
+    rather than sentences. Moved from the README's Limitations to docs/design-notes.md, which the README's
+    Limitations section links to; the numbers are gated where they now live.
     """
-    limits = README[README.index("## Limitations"):README.index("## Contributing")]
+    limits = DESIGN_NOTES
     for topic, needles in [
         # The mechanism, not just the fact. The first version of this entry said the eps floor *caused* the
         # inversion; eps in fact caps it, and there is a second cause (bin dilution) the entry omitted.
