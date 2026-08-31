@@ -1,6 +1,6 @@
 # torch-l1-snr design notes
 
-Measured detail behind the README. Everything here is a property of the losses, not a how-to; the README covers installation and usage. These figures were measured on the shipped code and are kept honest by `tests/test_docs.py`.
+Measured detail behind the README. Everything here is a property of the losses, not a how-to; the README covers installation and usage. These figures are measured on the shipped code and kept in sync with it by `tests/test_docs.py`.
 
 ## Blending L1 with L1SNR: `l1_weight`, `ref_level`, and `spec_ref_level`
 
@@ -14,7 +14,7 @@ Measured detail behind the README. Everything here is a property of the losses, 
 | targets at `mean\|y\| ~ 0.2`, 4x above `ref_level` | 3.6% | 12.5% | 25.0% | 43.8% | 75.0% |
 | targets at `mean\|y\| ~ 0.5`, 10x above `ref_level` | 8.2% | 25.6% | 44.6% | 65.2% | 87.9% |
 
-So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch. Earlier versions of this README stated these as flat percentages matching the parameter value, which was wrong in both directions depending on the data.
+So the knob is biased toward the SNR end across most of its range, and how strongly depends on how much your target levels vary within a batch.
 
 **What determines which row applies to you is your target level relative to `ref_level`, not how much your levels vary within a batch.** Level spread turns out to make almost no difference: a batch at `mean|y| ~ 0.05` gives 9.0% at `l1_weight=0.5` whether it is uniform or spans 40 dB. What matters is the level of the *loudest* stem in the batch, since that is what sets the gradient profile the metric measures.
 
