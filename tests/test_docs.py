@@ -468,26 +468,30 @@ def test_the_changelog_does_not_advertise_the_reverted_device_guard():
             "the device move is discussed before the did-not-ship list, which reads as a shipped change")
 
 
-def test_the_changelog_tops_out_at_a_dated_0_2_0_with_no_stray_unreleased():
-    """0.2.0 is the release, and 0.1.4 was folded into it since nothing past 0.1.3 ever shipped.
+def test_the_changelog_top_entry_matches_the_version_and_only_it_may_be_unreleased():
+    """The top CHANGELOG entry is the version being prepared, and only it may be `(unreleased)`.
 
-    The top entry must be `## 0.2.0 (YYYY-MM-DD)` -- dated, not `(unreleased)`, because a tag is imminent and
-    the CI tag gate checks __version__ against the tag. No `(unreleased)` marker may linger anywhere. A
-    leftover `## 0.1.4` section would describe a version nobody can install and split the only upgrade story
-    there is (0.1.3 to 0.2.0), and would strand that section's own claim that all four signatures match 0.1.3
-    exactly -- true of the abandoned tree, false of 0.2.0.
+    Catches version/changelog drift -- the CI tag gate checks __version__ against the tag. The top entry's
+    version must equal __version__; it may still say `(unreleased)` in development (strip to a date before
+    tagging, as 0.2.0 was). At most one `(unreleased)` marker exists and it is the top entry, so every entry
+    below stays dated. A leftover `## 0.1.4` section would describe a version nobody can install, and 0.1.4's
+    summary claim (four signatures identical to 0.1.3) must not survive into a later entry.
     """
+    version = torch_l1_snr.__version__
     top = re.search(r"^## (\S+) \(([^)]+)\)", CHANGELOG, re.MULTILINE)
-    assert top and top.group(1) == "0.2.0", f"the top changelog entry is not 0.2.0: {top and top.group(1)}"
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", top.group(2)), (
-        f"0.2.0 is dated {top.group(2)!r}, expected an ISO date; strip '(unreleased)' before tagging")
-    assert "(unreleased)" not in CHANGELOG, (
-        "a stray '(unreleased)' marker remains; every entry that ships must carry a real date")
+    assert top and top.group(1) == version, (
+        f"the top changelog entry is {top and top.group(1)!r}, not __version__={version!r}")
+    unreleased = re.findall(r"^## (\S+) \(unreleased\)", CHANGELOG, re.MULTILINE)
+    assert unreleased in ([], [version]), (
+        f"only the top entry may be unreleased; found {unreleased}")
+    if top.group(2) != "unreleased":
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}", top.group(2)), (
+            f"the top entry is dated {top.group(2)!r}; expected an ISO date or '(unreleased)'")
     assert not re.search(r"^## 0\.1\.4", CHANGELOG, re.MULTILINE), (
         "there is a 0.1.4 section; that version was never published and 0.2.0 contains all of its content")
     assert "signature change in this release. All four constructor signatures are identical to 0.1.3" \
         not in CHANGELOG, (
-        "0.1.4's summary claim survived the merge into 0.2.0, which does append parameters and so is not "
+        "0.1.4's summary claim survived into a later entry; it appends parameters and is not "
         "signature-identical to 0.1.3")
 
 
@@ -723,3 +727,63 @@ def test_running_the_suite_leaves_no_untracked_files_behind():
         "running the test suite left untracked files in the repo: "
         f"{sorted(leaked)}. Use tempfile.TemporaryDirectory (which cleans up wherever it lands) "
         "rather than mkdtemp/mktemp.")
+
+
+# --------------------------------------------------------------------------------------
+# 0.2.1 -- grad_scale is documented, and its magnitude claim is backed by measurement
+# --------------------------------------------------------------------------------------
+
+def _gh_slug(text):
+    """GitHub's header-anchor slug: lowercase, drop punctuation (keep word chars and spaces),
+    spaces to hyphens. `grad_scale` keeps its underscore; backticks are dropped."""
+    s = re.sub(r"[^\w\s-]", "", text.strip().lower())
+    return re.sub(r"\s+", "-", s)
+
+
+def test_grad_scale_is_surfaced_in_the_readme_and_the_design_notes():
+    """0.2.1 added grad_scale as an opt-in knob. The README must surface it with the clipping guidance
+    that is its whole reason to exist, and must state it does not change the loss value (else a reader
+    fears it perturbs training). The README's deep link into the design notes must resolve to a real
+    header, and the design notes must carry the value-preserving and optimizer-specific claims.
+    """
+    assert "grad_scale" in README, "the README never mentions grad_scale"
+    assert "clip" in README.lower(), "the README does not connect grad_scale to gradient clipping"
+    assert re.search(r"without changing the loss value|does not change the loss", README), (
+        "the README does not state grad_scale leaves the loss value unchanged")
+    # the README deep-links to a design-notes header; that anchor must exist
+    m = re.search(r"docs/design_notes\.md#([\w-]+)", README)
+    assert m, "the README does not link into docs/design_notes.md for the gradient discussion"
+    anchor = m.group(1)
+    headers = {_gh_slug(h) for h in re.findall(r"^#+\s+(.*)$", DESIGN_NOTES, re.MULTILINE)}
+    assert anchor in headers, (
+        f"README links to #{anchor} but no design-notes header slugifies to it; headers are {sorted(headers)}")
+    assert "bit-exact" in DESIGN_NOTES and "grad_scale" in DESIGN_NOTES, (
+        "the design notes do not state the loss value is bit-exact regardless of grad_scale")
+    assert "learning-rate rescale" in DESIGN_NOTES, (
+        "the design notes do not carry the SGD learning-rate-rescale caveat")
+
+
+def test_the_hundreds_times_magnitude_claim_is_backed_by_measurement():
+    """The docs claim these gradients are 'a few hundred times larger than a plain L1 loss' and that the
+    ratio 'grows as the estimate converges'. Both are measurable, so measure them rather than trust the
+    prose. On the documented [4, 2, 44100] @ 0.05 shape: L1SNR's input gradient norm over plain L1's must
+    be in the hundreds at 10% relative error, and must rise monotonically as the error shrinks. A change
+    that quietly flattened the gradient would make the doc false and trip this.
+    """
+    import torch.nn.functional as F
+
+    def ratio(rel_err):
+        torch.manual_seed(1)
+        act = 0.05 * torch.randn(4, 2, 44100)
+        noise = 0.05 * torch.randn_like(act)
+        est_s = (act + rel_err * noise).detach().clone().requires_grad_(True)
+        L1SNRLoss("m")(est_s, act).backward()
+        gsnr = est_s.grad.norm().item()
+        est_l = (act + rel_err * noise).detach().clone().requires_grad_(True)
+        F.l1_loss(est_l, act).backward()
+        return gsnr / est_l.grad.norm().item()
+
+    r50, r10, r1 = ratio(0.5), ratio(0.1), ratio(0.01)
+    assert 200 < r10, f"L1SNR/L1 gradient ratio at 10% error is {r10:.0f}x, not the documented hundreds"
+    assert r50 < r10 < r1, (
+        f"ratio does not grow as the estimate converges: 50%={r50:.0f}x 10%={r10:.0f}x 1%={r1:.0f}x")

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.1 (unreleased)
+
+Two non-breaking follow-ups to 0.2.0 for tuning the losses. Neither changes the default output: float32 and
+float64 values are byte-identical, so D1 stays bit-exact to the authors' BandIt code.
+
+### Added
+
+- **`grad_scale`** on every loss (default `1.0`, no effect). These losses produce gradients a few hundred
+  times larger than a plain L1 loss, so a run on the common default gradient-clip threshold of `1.0` would
+  clip away most of a useful gradient. `grad_scale` scales the **gradient** (not the value) into a standard
+  range, via an autograd Function, so the loss value stays bit-exact and logged curves and `state_dict` are
+  unchanged. Adam is unaffected by the scale itself (a constant factor cancels in its update); for plain SGD
+  a non-`1.0` value is a learning-rate rescale. Whether to default it on is a later decision.
+
+### Fixed
+
+- **A lowered `eps` now takes effect in half precision.** `eps` is added to a reduced error before the log;
+  in bfloat16/float16 a small eps was silently dropped, so lowering `eps` did nothing on a half-precision
+  run, and in float16 a low eps could send a silent target to `+inf`. The eps-add-and-log now runs in
+  float32 (float32/float64 paths unchanged). A half-precision input consequently returns a float32 loss, and
+  the previous float16 `+inf`-on-silence limitation is gone.
+
 ## 0.2.0 (2026-08-31)
 
 ### BREAKING CHANGES
