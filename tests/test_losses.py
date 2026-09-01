@@ -13,6 +13,7 @@ from torch_l1_snr import (
     L1SNRDBLoss,
     STFTL1SNRDBLoss,
     MultiL1SNRDBLoss,
+    L2SNRLoss,
 )
 
 # --- Test Helper: Stem Wrapper ---
@@ -995,3 +996,46 @@ def test_a_low_eps_survives_half_precision_in_l1snrloss(dtype):
         f"{dtype} at eps={eps:.0e} gave {out.item()} -- the eps floor was flushed before the log")
     expected = 10.0 * math.log10((scale + eps) / eps)  # act is silent, so l1_true = 0
     assert out.float().item() == pytest.approx(expected, abs=0.1)
+
+
+# grad_scale: scales the gradient (for clip-threshold ergonomics) while leaving the loss value bit-exact.
+_GRAD_SCALE_MAKERS = [
+    ("L1SNRLoss", lambda gs: L1SNRLoss("t", grad_scale=gs)),
+    ("L1SNRDBLoss", lambda gs: L1SNRDBLoss("t", grad_scale=gs)),
+    ("STFTL1SNRDBLoss", lambda gs: STFTL1SNRDBLoss("t", grad_scale=gs)),
+    ("MultiL1SNRDBLoss", lambda gs: MultiL1SNRDBLoss("t", grad_scale=gs)),
+    ("L2SNRLoss", lambda gs: L2SNRLoss("t", grad_scale=gs)),
+]
+
+
+@pytest.mark.parametrize("name,make", _GRAD_SCALE_MAKERS, ids=[c[0] for c in _GRAD_SCALE_MAKERS])
+def test_grad_scale_preserves_the_value_and_scales_the_gradient(name, make):
+    """`grad_scale` multiplies the gradient only; the value is untouched.
+
+    Implemented as an autograd Function (identity forward, scaled backward) so the loss VALUE stays
+    bit-exact -- D1==BandIt and every logged number are unaffected -- while the gradient is scaled. This lets
+    a user right-size the gradient for a fixed clip threshold without changing what they optimize or log.
+    The scale must land exactly (not squared) even on the composed classes, which construct child losses:
+    grad_scale is applied once at the outermost output, and children are built at grad_scale=1.0.
+    """
+    torch.manual_seed(0)
+    act = torch.randn(2, 4096) * 0.05
+    est_base = act + 0.01 * torch.randn_like(act)
+    s = 0.1
+
+    # value bit-exact across grad_scale
+    assert torch.equal(make(1.0)(est_base, act), make(s)(est_base, act)), (
+        f"{name}: grad_scale changed the loss value; it must scale only the gradient")
+
+    # gradient scaled by exactly s (a composed class double-applying would give s**2)
+    def grad(gs):
+        e = est_base.clone().requires_grad_(True)
+        make(gs)(e, act).backward()
+        return e.grad.clone()
+
+    g1, gs_ = grad(1.0), grad(s)
+    # a real gradient, not a constant loss's zero -- also what lets this detect a stubbed forward()
+    assert g1.norm() > 1e-4, f"{name}: gradient is ~zero; not exercising a real loss"
+    assert torch.allclose(gs_, g1 * s, atol=1e-7), (
+        f"{name}: gradient not scaled by exactly {s}; got a mean ratio of "
+        f"{(gs_.norm() / g1.norm()).item():.4f}x")
