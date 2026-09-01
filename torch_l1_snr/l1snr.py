@@ -60,6 +60,20 @@ def _validate_ref_level(value):
         )
 
 
+def _promote_half(x):
+    """Upcast half precision to float32 for the eps-add-and-log; preserve float32/float64.
+
+    eps is added to a reduced quantity -- mean|error| or mean(error^2), a per-example scalar -- before the
+    log. In bfloat16/float16 that addition silently drops a small eps (its ~2-3 significant digits cannot
+    hold, say, 3e-4 + 1e-5), so a lowered eps never takes effect: measured, the gradient came out ~14% off
+    the float32 gradient at eps=1e-5 near convergence. Promoting these tiny scalars to float32 costs nothing
+    and lets a lowered eps do its job. float64 is preserved (never downcast); float32 is unchanged, so the
+    default eps=1e-3 path is byte-identical and the D1==BandIt equivalence is untouched. Mirrors the
+    accumulation-dtype rule used for the spectrogram cross-resolution sum.
+    """
+    return x.float() if x.dtype not in (torch.float32, torch.float64) else x
+
+
 def _validate_matching_shapes(estimates, actuals):
     """Reject differing shapes before any reshape flattens the difference away.
 
@@ -294,6 +308,10 @@ class L1SNRLoss(torch.nn.Module):
         # L1 errors and reference
         l1_error = torch.mean(torch.abs(est_source - act_source), dim=-1)
         l1_true = torch.mean(torch.abs(act_source), dim=-1)
+        # Upcast the reduced errors so a lowered eps survives bf16; no-op for float32/float64. See
+        # _promote_half. This also makes half-precision output float32 uniformly across this class.
+        l1_error = _promote_half(l1_error)
+        l1_true = _promote_half(l1_true)
 
         # Auto-balanced L1/SNR mixing
         w = float(self.l1_weight)
@@ -363,20 +381,14 @@ class L2SNRLoss(torch.nn.Module):
     `tau=0` is accepted and simply removes the relative floor, leaving `eps` alone; the cap is then
     undefined rather than 30 dB.
 
-    **Do not run this loss in pure float16, and do not lower `eps` below 1e-6 if you might.** float16's
-    smallest subnormal is 5.96e-08, so `eps=1e-8` rounds to exactly zero; with a silent target both
-    numerator and denominator then collapse and the loss returns **+inf**, which kills a run. The
-    default 1e-6 survives, but only as a float16 subnormal (1.013e-06), so hardware that flushes
-    subnormals to zero would break it too. float16's smallest NORMAL value is 6.1e-05, which is far too
-    large to use as a floor here, so there is no fully float16-safe setting.
-
-    bfloat16 is unaffected: it trades mantissa for exponent (8 mantissa bits against float16's 11, but
-    float32's exponent range), so 1e-8 does not underflow, while being *less* precise per digit. No binary
-    float represents 1e-8 exactly -- bfloat16 stores 1.0012e-08 -- but it does not round to zero. That
-    trade is why the wider-range format is the safe one here. `torch.autocast` does NOT rescue float16:
-    mean and log10 are not autocast-cast ops, so the computation stays in the input dtype (measured:
-    float16 in, float16 out, under autocast(float16)). A typical mixed-precision loop survives through
-    ordinary promotion in `estimates - actuals` when one side is float32, not through autocast.
+    **Half precision and a low eps.** The reduced energies are upcast to float32 before the eps-add and the
+    log (see `_promote_half`), so a low eps is applied in float32 and is not flushed by the input dtype. This
+    is what lets `eps` be lowered on a bfloat16 or float16 run: previously eps=1e-8 rounded to zero in
+    float16 (smallest subnormal 5.96e-8), the silent-target floor vanished, and the loss returned +inf.
+    Because of the upcast, a half-precision input now returns a float32 loss (float32/float64 inputs are
+    unchanged). One residual float16 caveat remains and is separate from eps: `mean((e)^2)` squares before
+    reducing, so an error below ~2.4e-4 underflows the mean itself in float16; bfloat16, with float32's
+    exponent range, does not, and remains the safer half format.
 
     **This loss reports about TWICE the decibels D1 does for the same estimate, and that is not a bug
     in either.** D1 takes 10*log10 of an AMPLITUDE ratio (mean|e| / mean|y|), which is the authors'
@@ -434,8 +446,8 @@ class L2SNRLoss(torch.nn.Module):
         est_source = estimates.reshape(batch_size, -1)
         act_source = actuals.reshape(batch_size, -1)
 
-        err_energy = torch.mean((est_source - act_source) ** 2, dim=-1)
-        ref_energy = torch.mean(act_source ** 2, dim=-1)
+        err_energy = _promote_half(torch.mean((est_source - act_source) ** 2, dim=-1))
+        ref_energy = _promote_half(torch.mean(act_source ** 2, dim=-1))
 
         d2 = 10.0 * torch.log10(
             (err_energy + self.tau * ref_energy + self.eps) / (ref_energy + self.eps)
@@ -938,12 +950,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # (relative 1.6e-07 in float32, 3.0e-16 in float64). Measured time saving was 0.2 ms of a 344 ms
         # forward, about 0.06%. Declined on the same grounds as the window-normalization fold above: a
         # negligible gain does not justify changing the numbers a training run reports.
-        err_re = torch.mean(torch.abs(est_re - act_re), dim=1)
-        ref_re = torch.mean(torch.abs(act_re), dim=1)
-        err_im = torch.mean(torch.abs(est_im - act_im), dim=1)
-        ref_im = torch.mean(torch.abs(act_im), dim=1)
+        err_re = _promote_half(torch.mean(torch.abs(est_re - act_re), dim=1))
+        ref_re = _promote_half(torch.mean(torch.abs(act_re), dim=1))
+        err_im = _promote_half(torch.mean(torch.abs(est_im - act_im), dim=1))
+        ref_im = _promote_half(torch.mean(torch.abs(act_im), dim=1))
 
-        # D1 = 10*log10((mean|e| + eps)/(mean|y| + eps)); means, not sums -- see L1SNRLoss
+        # D1 = 10*log10((mean|e| + eps)/(mean|y| + eps)); means, not sums -- see L1SNRLoss.
+        # Reduced errors upcast so a lowered l1snr_eps survives bf16 (no-op for float32/float64).
         d1_re = 10.0 * torch.log10((err_re + self.l1snr_eps) / (ref_re + self.l1snr_eps))
         d1_im = 10.0 * torch.log10((err_im + self.l1snr_eps) / (ref_im + self.l1snr_eps))
         d1_sum = torch.mean(d1_re + d1_im)  # mean over batch

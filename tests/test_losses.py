@@ -941,44 +941,57 @@ def test_swapping_the_time_norm_shifts_the_multi_domain_balance():
         f"the time branch should roughly double its share: D1 {share_d1:.3f} vs L2 {share_l2:.3f}")
 
 
-@pytest.mark.parametrize("eps,fp16_safe", [(1e-6, True), (1e-8, False)])
-def test_l2snr_eps_below_float16s_subnormal_floor_gives_inf_on_a_silent_target(eps, fp16_safe):
-    """float16's smallest subnormal is 5.96e-08, so eps=1e-8 rounds to zero and the floor disappears.
+@pytest.mark.parametrize("eps", [1e-6, 1e-8])
+def test_l2snr_eps_survives_half_precision_at_a_silent_target(eps):
+    """The eps-add-and-log runs in float32, so the silent-target floor holds even at an eps below float16's
+    subnormal range.
 
-    Numerator and denominator then both collapse on a silent target and the loss returns +inf, which
-    kills a training run. This is the concrete reason not to lower the eps default. bfloat16 is fine:
-    it has float32's exponent range, so it represents 1e-8 exactly despite having FEWER mantissa bits.
+    Before the fix, float16's smallest subnormal (5.96e-8) meant eps=1e-8 rounded to zero: both numerator
+    and denominator collapsed on a silent target and the loss returned +inf, which was the concrete reason
+    the eps default could not be lowered on a float16 run. `_promote_half` now upcasts the reduced energies
+    before the eps-add, so a low eps is preserved in both half formats -- bfloat16 always survived (it has
+    float32's exponent range), and float16 now does too. Asserts the exact floor 10*log10((scale^2+eps)/eps);
+    a silent target is the cleanest eps signal, with no reduction or input-rounding confound.
     """
     from torch_l1_snr import L2SNRLoss
     loss_fn = L2SNRLoss("t", eps=eps)
-
-    assert (torch.tensor(eps, dtype=torch.float16).item() != 0.0) is fp16_safe
-
-    # With a silent target the whole floor is eps, so the exact value is 10*log10((scale^2 + eps)/eps).
-    # Asserting the VALUE, not just finiteness: a stubbed constant forward() is finite too.
     scale = 1e-2
     expected = 10.0 * math.log10((scale ** 2 + eps) / eps)
 
-    silent16 = torch.zeros(2, 4000, dtype=torch.float16)
-    out16 = loss_fn(silent16 + scale, silent16)
-    assert bool(torch.isfinite(out16)) is fp16_safe, (
-        f"float16 at eps={eps:.0e} gave {out16.item()}, expected "
-        f"{'a finite value' if fp16_safe else '+inf (eps flushed to zero)'}")
-    if fp16_safe:
-        assert out16.item() == pytest.approx(expected, abs=0.1)
+    for dtype in (torch.float16, torch.bfloat16):
+        silent = torch.zeros(2, 4000, dtype=dtype)
+        out = loss_fn(silent + scale, silent)
+        assert torch.isfinite(out), (
+            f"{dtype} at eps={eps:.0e} gave {out.item()} -- the eps floor was flushed before the log")
+        assert out.float().item() == pytest.approx(expected, abs=0.1), (
+            f"{dtype} at eps={eps:.0e} gave {out.float().item()}, expected {expected:.4f}")
 
-    # bfloat16 survives either way: float32's exponent range, despite fewer mantissa bits.
-    silentbf = torch.zeros(2, 4000, dtype=torch.bfloat16)
-    outbf = loss_fn(silentbf + scale, silentbf)
-    assert outbf.item() == pytest.approx(expected, abs=0.1), (
-        f"bfloat16 at eps={eps:.0e} gave {outbf.item()}, expected {expected:.4f}")
-
-    # NOTE: this block does NOT test autocast. mean and log10 are not autocast-cast ops, so autocast
-    # does not promote anything here, and `torch.zeros(2, 4000)` is float32 regardless -- so this measures
-    # float32 and cannot fail for an autocast reason. Kept because the float32 value is still worth
-    # pinning; replacing it with a real half-precision autocast gate is ticketed.
+    # float32 baseline. NOTE: mean and log10 are not autocast-cast ops, and torch.zeros(2, 4000) is float32,
+    # so this measures the float32 path and cannot fail for an autocast reason -- kept to pin that value.
     with torch.autocast(device_type="cpu", dtype=torch.float16):
         silent32 = torch.zeros(2, 4000)
         out = loss_fn(silent32 + scale, silent32)
-    assert out.item() == pytest.approx(expected, abs=0.1), (
-        f"autocast(float16) at eps={eps:.0e} gave {out.item()}, expected {expected:.4f}")
+    assert out.item() == pytest.approx(expected, abs=0.1)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["float16", "bfloat16"])
+def test_a_low_eps_survives_half_precision_in_l1snrloss(dtype):
+    """A low eps is applied in float32, so it is not flushed in half precision.
+
+    Before the fix, eps=1e-8 rounded to zero in float16 (smallest subnormal 5.96e-8): the silent-target
+    floor `10*log10((mean|e| + eps)/(mean|y| + eps))` collapsed to `+inf`, which is the concrete reason the
+    eps default could not be lowered on a float16 run. The reduced errors are now upcast to float32 before
+    the eps-add-and-log (see `_promote_half`), so the floor holds in both half formats. A silent target is
+    the cleanest eps signal there is -- the value is determined entirely by eps, with no reduction or
+    input-rounding confound -- so this asserts the exact floor.
+
+    L2SNRLoss has the sibling silent-target gate below; STFTL1SNRDBLoss's floor is per-resolution and is
+    covered by its own value tests.
+    """
+    eps, scale = 1e-8, 1e-2
+    silent = torch.zeros(2, 4000, dtype=dtype)
+    out = L1SNRLoss("t", eps=eps)(silent + scale, silent)
+    assert torch.isfinite(out), (
+        f"{dtype} at eps={eps:.0e} gave {out.item()} -- the eps floor was flushed before the log")
+    expected = 10.0 * math.log10((scale + eps) / eps)  # act is silent, so l1_true = 0
+    assert out.float().item() == pytest.approx(expected, abs=0.1)
