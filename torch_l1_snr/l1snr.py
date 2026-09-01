@@ -60,6 +60,56 @@ def _validate_ref_level(value):
         )
 
 
+def _promote_half(x):
+    """Upcast half precision to float32 for the eps-add-and-log; preserve float32/float64.
+
+    eps is added to a reduced quantity -- mean|error| or mean(error^2), a per-example scalar -- before the
+    log. In bfloat16/float16 that addition silently drops a small eps (its ~2-3 significant digits cannot
+    hold, say, 3e-4 + 1e-5), so a lowered eps never takes effect: measured, the gradient came out ~14% off
+    the float32 gradient at eps=1e-5 near convergence. Promoting these tiny scalars to float32 costs nothing
+    and lets a lowered eps do its job. float64 is preserved (never downcast); float32 is unchanged, so the
+    default eps=1e-3 path is byte-identical and the D1==BandIt equivalence is untouched. Mirrors the
+    accumulation-dtype rule used for the spectrogram cross-resolution sum.
+    """
+    return x.float() if x.dtype not in (torch.float32, torch.float64) else x
+
+
+class _GradScale(torch.autograd.Function):
+    """Scale the gradient by a constant while leaving the value identical.
+
+    Identity in the forward, so the loss VALUE is bit-exact -- D1==BandIt and every logged number are
+    untouched -- and grad_scale=1.0 is a true no-op. The backward multiplies the upstream gradient by the
+    scale. Because the returned gradient is deliberately not the true gradient of the value, gradcheck must
+    run with grad_scale=1.0.
+    """
+
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output * ctx.scale, None
+
+
+def _apply_grad_scale(loss, grad_scale):
+    """Right-size the gradient for a fixed gradient-clipping threshold, without changing the value.
+
+    These losses produce gradients a few hundred times larger than a plain L1 loss, so a user on the common
+    default clip of 1.0 would clip away most of a useful gradient. `grad_scale` shrinks the gradient into a
+    standard range. Adam-style optimizers are unaffected by the scale itself (a constant factor cancels in
+    the m/sqrt(v) update); it matters only for the clip, which runs before the optimizer. For plain SGD a
+    non-1.0 grad_scale is exactly a learning-rate rescale.
+
+    At the default grad_scale=1.0 this returns the loss untouched -- no extra autograd node -- so the default
+    path and every existing gradient are byte-identical.
+    """
+    if grad_scale == 1.0:
+        return loss
+    return _GradScale.apply(loss, grad_scale)
+
+
 def _validate_matching_shapes(estimates, actuals):
     """Reject differing shapes before any reshape flattens the difference away.
 
@@ -238,6 +288,10 @@ class L1SNRLoss(torch.nn.Module):
     Attributes:
         name (str): Name identifier for the loss.
         weight (float): Global weight multiplier for the loss.
+        grad_scale (float): Scales the GRADIENT only, leaving the loss value unchanged. Default 1.0
+            (no effect). These losses produce gradients far larger than a plain L1 loss; lower this
+            (e.g. 0.1) so they fit a gradient-clipping threshold. Adam is unaffected by the scale
+            itself; for SGD it rescales the learning rate.
         eps (float): Small epsilon for numerical stability in D1 (default 1e-3 per the papers).
         l1_weight (float): Weight for the L1 term mixed into L1SNR.
         ref_level (float): Typical mean-absolute amplitude of your targets, used to scale the L1
@@ -258,6 +312,7 @@ class L1SNRLoss(torch.nn.Module):
         eps: float = 1e-3,
         l1_weight: float = 0.0,
         ref_level: float = 0.05,
+        grad_scale: float = 1.0,
     ):
         super().__init__()
         _validate_unit_range("l1_weight", l1_weight)
@@ -266,6 +321,8 @@ class L1SNRLoss(torch.nn.Module):
         self.name = name
         _validate_non_negative("weight", weight)
         self.weight = weight
+        _validate_positive("grad_scale", grad_scale)
+        self.grad_scale = grad_scale
         self.eps = eps
         self._l1_weight = l1_weight
 
@@ -294,19 +351,23 @@ class L1SNRLoss(torch.nn.Module):
         # L1 errors and reference
         l1_error = torch.mean(torch.abs(est_source - act_source), dim=-1)
         l1_true = torch.mean(torch.abs(act_source), dim=-1)
+        # Upcast the reduced errors so a lowered eps survives bf16; no-op for float32/float64. See
+        # _promote_half. This also makes half-precision output float32 uniformly across this class.
+        l1_error = _promote_half(l1_error)
+        l1_true = _promote_half(l1_true)
 
         # Auto-balanced L1/SNR mixing
         w = float(self.l1_weight)
 
         # Pure-L1 shortcut: avoid D1 computation
         if w >= 1.0:
-            return torch.mean(l1_error) * self.weight
+            return _apply_grad_scale(torch.mean(l1_error) * self.weight, self.grad_scale)
 
         # If pure SNR (w == 0) we can skip L1 scaling math
         if w <= 0.0:
             d1 = 10.0 * torch.log10((l1_error + self.eps) / (l1_true + self.eps))
             l1snr_loss = torch.mean(d1)
-            return l1snr_loss * self.weight
+            return _apply_grad_scale(l1snr_loss * self.weight, self.grad_scale)
 
         # Mixed path
         d1 = 10.0 * torch.log10((l1_error + self.eps) / (l1_true + self.eps))
@@ -321,7 +382,7 @@ class L1SNRLoss(torch.nn.Module):
         l1_term = torch.mean(l1_error) * scale_time
 
         loss = (1.0 - w) * l1snr_loss + w * l1_term
-        return loss * self.weight
+        return _apply_grad_scale(loss * self.weight, self.grad_scale)
 
 
 class L2SNRLoss(torch.nn.Module):
@@ -363,20 +424,14 @@ class L2SNRLoss(torch.nn.Module):
     `tau=0` is accepted and simply removes the relative floor, leaving `eps` alone; the cap is then
     undefined rather than 30 dB.
 
-    **Do not run this loss in pure float16, and do not lower `eps` below 1e-6 if you might.** float16's
-    smallest subnormal is 5.96e-08, so `eps=1e-8` rounds to exactly zero; with a silent target both
-    numerator and denominator then collapse and the loss returns **+inf**, which kills a run. The
-    default 1e-6 survives, but only as a float16 subnormal (1.013e-06), so hardware that flushes
-    subnormals to zero would break it too. float16's smallest NORMAL value is 6.1e-05, which is far too
-    large to use as a floor here, so there is no fully float16-safe setting.
-
-    bfloat16 is unaffected: it trades mantissa for exponent (8 mantissa bits against float16's 11, but
-    float32's exponent range), so 1e-8 does not underflow, while being *less* precise per digit. No binary
-    float represents 1e-8 exactly -- bfloat16 stores 1.0012e-08 -- but it does not round to zero. That
-    trade is why the wider-range format is the safe one here. `torch.autocast` does NOT rescue float16:
-    mean and log10 are not autocast-cast ops, so the computation stays in the input dtype (measured:
-    float16 in, float16 out, under autocast(float16)). A typical mixed-precision loop survives through
-    ordinary promotion in `estimates - actuals` when one side is float32, not through autocast.
+    **Half precision and a low eps.** The reduced energies are upcast to float32 before the eps-add and the
+    log (see `_promote_half`), so a low eps is applied in float32 and is not flushed by the input dtype. This
+    is what lets `eps` be lowered on a bfloat16 or float16 run: previously eps=1e-8 rounded to zero in
+    float16 (smallest subnormal 5.96e-8), the silent-target floor vanished, and the loss returned +inf.
+    Because of the upcast, a half-precision input now returns a float32 loss (float32/float64 inputs are
+    unchanged). One residual float16 caveat remains and is separate from eps: `mean((e)^2)` squares before
+    reducing, so an error below ~2.4e-4 underflows the mean itself in float16; bfloat16, with float32's
+    exponent range, does not, and remains the safer half format.
 
     **This loss reports about TWICE the decibels D1 does for the same estimate, and that is not a bug
     in either.** D1 takes 10*log10 of an AMPLITUDE ratio (mean|e| / mean|y|), which is the authors'
@@ -407,6 +462,10 @@ class L2SNRLoss(torch.nn.Module):
     Attributes:
         name (str): Name identifier for the loss.
         weight (float): Global weight multiplier for the loss.
+        grad_scale (float): Scales the GRADIENT only, leaving the loss value unchanged. Default 1.0
+            (no effect). These losses produce gradients far larger than a plain L1 loss; lower this
+            (e.g. 0.1) so they fit a gradient-clipping threshold. Adam is unaffected by the scale
+            itself; for SGD it rescales the learning rate.
         eps (float): Absolute floor on the error energy, guarding silent targets (default 1e-6).
         tau (float): Target-relative floor; caps SNR at -10*log10(tau) dB (default 1e-3, i.e. 30 dB).
     """
@@ -416,6 +475,7 @@ class L2SNRLoss(torch.nn.Module):
         weight: float = 1.0,
         eps: float = 1e-6,
         tau: float = 1e-3,
+        grad_scale: float = 1.0,
     ):
         super().__init__()
         self.name = name
@@ -423,6 +483,8 @@ class L2SNRLoss(torch.nn.Module):
         _validate_positive("eps", eps)
         _validate_non_negative("tau", tau)
         self.weight = weight
+        _validate_positive("grad_scale", grad_scale)
+        self.grad_scale = grad_scale
         self.eps = eps
         self.tau = tau
 
@@ -434,13 +496,13 @@ class L2SNRLoss(torch.nn.Module):
         est_source = estimates.reshape(batch_size, -1)
         act_source = actuals.reshape(batch_size, -1)
 
-        err_energy = torch.mean((est_source - act_source) ** 2, dim=-1)
-        ref_energy = torch.mean(act_source ** 2, dim=-1)
+        err_energy = _promote_half(torch.mean((est_source - act_source) ** 2, dim=-1))
+        ref_energy = _promote_half(torch.mean(act_source ** 2, dim=-1))
 
         d2 = 10.0 * torch.log10(
             (err_energy + self.tau * ref_energy + self.eps) / (ref_energy + self.eps)
         )
-        return torch.mean(d2) * self.weight
+        return _apply_grad_scale(torch.mean(d2) * self.weight, self.grad_scale)
 
 
 class L1SNRDBLoss(torch.nn.Module):
@@ -476,6 +538,10 @@ class L1SNRDBLoss(torch.nn.Module):
     Attributes:
         name (str): The name identifier for the loss.
         weight (float): The overall weight multiplier for the loss.
+        grad_scale (float): Scales the GRADIENT only, leaving the loss value unchanged. Default 1.0
+            (no effect). These losses produce gradients far larger than a plain L1 loss; lower this
+            (e.g. 0.1) so they fit a gradient-clipping threshold. Adam is unaffected by the scale
+            itself; for SGD it rescales the learning rate.
         lambda0 (float): Minimum regularization weight (λ_min).
         delta_lambda (float): Range of extra weight for regularization (Δλ).
         l1snr_eps (float): Epsilon value for the L1SNR component to avoid log(0).
@@ -515,6 +581,7 @@ class L1SNRDBLoss(torch.nn.Module):
         l1_weight: float = 0.0,
         reg_coef: float = 1.0,
         ref_level: float = 0.05,
+        grad_scale: float = 1.0,
     ):
         super().__init__()
         _validate_ref_level(ref_level)
@@ -522,6 +589,8 @@ class L1SNRDBLoss(torch.nn.Module):
         self.name = name
         _validate_non_negative("weight", weight)
         self.weight = weight
+        _validate_positive("grad_scale", grad_scale)
+        self.grad_scale = grad_scale
         _validate_non_negative("reg_coef", reg_coef)
         _validate_non_negative("lambda0", lambda0)
         _validate_non_negative("delta_lambda", delta_lambda)
@@ -606,7 +675,7 @@ class L1SNRDBLoss(torch.nn.Module):
         # Pure L1 mode - efficient path that bypasses SNR and regularization
         if self.l1_loss is not None:
             l1_loss = self.l1_loss(est_source, act_source)
-            return l1_loss * self.weight
+            return _apply_grad_scale(l1_loss * self.weight, self.grad_scale)
 
         # Standard mode with L1SNR, regularization, and optional weighted L1
         # 1. L1SNR reconstruction loss (with L1 component if l1_weight > 0)
@@ -630,7 +699,7 @@ class L1SNRDBLoss(torch.nn.Module):
             # Skip regularization calculation entirely
             total_loss = l1snr_loss
 
-        return total_loss * self.weight
+        return _apply_grad_scale(total_loss * self.weight, self.grad_scale)
 
 
 class STFTL1SNRDBLoss(torch.nn.Module):
@@ -678,6 +747,10 @@ class STFTL1SNRDBLoss(torch.nn.Module):
     Attributes:
         name (str): The name identifier for the loss.
         weight (float): The overall weight multiplier for the loss.
+        grad_scale (float): Scales the GRADIENT only, leaving the loss value unchanged. Default 1.0
+            (no effect). These losses produce gradients far larger than a plain L1 loss; lower this
+            (e.g. 0.1) so they fit a gradient-clipping threshold. Adam is unaffected by the scale
+            itself; for SGD it rescales the learning rate.
         lambda0 (float): Minimum regularization weight (λ_min).
         delta_lambda (float): Range of extra weight for regularization (Δλ).
         l1snr_eps (float): Epsilon value for the L1SNR component to avoid log(0).
@@ -751,6 +824,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         ref_level: float = 0.05,
         spec_ref_level: Optional[float] = None,
         check_finite: bool = True,
+        grad_scale: float = 1.0,
     ):
         super().__init__()
         _validate_ref_level(ref_level)
@@ -768,6 +842,8 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         self.name = name
         _validate_non_negative("weight", weight)
         self.weight = weight
+        _validate_positive("grad_scale", grad_scale)
+        self.grad_scale = grad_scale
         self.min_audio_length = min_audio_length
 
         _validate_stft_params(n_ffts, hop_lengths, win_lengths, window_fn)
@@ -938,12 +1014,13 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         # (relative 1.6e-07 in float32, 3.0e-16 in float64). Measured time saving was 0.2 ms of a 344 ms
         # forward, about 0.06%. Declined on the same grounds as the window-normalization fold above: a
         # negligible gain does not justify changing the numbers a training run reports.
-        err_re = torch.mean(torch.abs(est_re - act_re), dim=1)
-        ref_re = torch.mean(torch.abs(act_re), dim=1)
-        err_im = torch.mean(torch.abs(est_im - act_im), dim=1)
-        ref_im = torch.mean(torch.abs(act_im), dim=1)
+        err_re = _promote_half(torch.mean(torch.abs(est_re - act_re), dim=1))
+        ref_re = _promote_half(torch.mean(torch.abs(act_re), dim=1))
+        err_im = _promote_half(torch.mean(torch.abs(est_im - act_im), dim=1))
+        ref_im = _promote_half(torch.mean(torch.abs(act_im), dim=1))
 
-        # D1 = 10*log10((mean|e| + eps)/(mean|y| + eps)); means, not sums -- see L1SNRLoss
+        # D1 = 10*log10((mean|e| + eps)/(mean|y| + eps)); means, not sums -- see L1SNRLoss.
+        # Reduced errors upcast so a lowered l1snr_eps survives bf16 (no-op for float32/float64).
         d1_re = 10.0 * torch.log10((err_re + self.l1snr_eps) / (ref_re + self.l1snr_eps))
         d1_im = 10.0 * torch.log10((err_im + self.l1snr_eps) / (ref_im + self.l1snr_eps))
         d1_sum = torch.mean(d1_re + d1_im)  # mean over batch
@@ -1088,7 +1165,9 @@ class STFTL1SNRDBLoss(torch.nn.Module):
                     stacklevel=2,
                 )
                 self._fallback_warned = True
-            return self.fallback_time_loss(estimates, actuals, *args, **kwargs) * self.weight
+            return _apply_grad_scale(
+                self.fallback_time_loss(estimates, actuals, *args, **kwargs) * self.weight,
+                self.grad_scale)
 
         # MPS workaround: route STFT computation through CPU to avoid
         # incorrect gradients from torch.stft backward above ~65,536 samples.
@@ -1209,7 +1288,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
             # -0.0 with a zero gradient: a corrupt target read as a perfectly healthy step. The estimate's
             # sum still supplies the graph connection; the target's contributes only its finiteness.
             zero = (est_source.sum() + act_source.sum().detach()) * 0.0
-            return zero.to(device) * self.weight
+            return _apply_grad_scale(zero.to(device) * self.weight, self.grad_scale)
 
         # Average losses across valid transforms
         avg_spec_loss = total_spec_loss / valid_transforms
@@ -1229,7 +1308,7 @@ class STFTL1SNRDBLoss(torch.nn.Module):
         if _use_cpu:
             result = result.to(device)
 
-        return result
+        return _apply_grad_scale(result, self.grad_scale)
 
 
 class MultiL1SNRDBLoss(torch.nn.Module):
@@ -1266,6 +1345,10 @@ class MultiL1SNRDBLoss(torch.nn.Module):
     Attributes:
         name (str): The name identifier for the loss.
         weight (float): The overall weight multiplier for the loss.
+        grad_scale (float): Scales the GRADIENT only, leaving the loss value unchanged. Default 1.0
+            (no effect). These losses produce gradients far larger than a plain L1 loss; lower this
+            (e.g. 0.1) so they fit a gradient-clipping threshold. Adam is unaffected by the scale
+            itself; for SGD it rescales the learning rate.
         spec_weight (float): Coefficient on the spectrogram-domain loss, in [0.0, 1.0]. The time
             domain receives (1 - spec_weight). Values outside that range raise ValueError:
             above 1.0 the time coefficient would be negative, which instructs the optimizer to
@@ -1387,6 +1470,7 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         # objective (e.g. L2SNRLoss) against D1 without a second multi-domain class. Appended, like every
         # 0.2.0 addition, so positional calls written against 0.1.3 keep their meaning.
         time_loss_module: Optional[torch.nn.Module] = None,
+        grad_scale: float = 1.0,
     ):
         super().__init__()
         # spec_weight above 1 makes the time-domain coefficient (1 - spec_weight) negative in forward,
@@ -1400,6 +1484,8 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         self.name = name
         _validate_non_negative("weight", weight)
         self.weight = weight
+        _validate_positive("grad_scale", grad_scale)
+        self.grad_scale = grad_scale
         self.spec_weight = spec_weight
 
         _validate_unit_range("l1_weight", l1_weight)
@@ -1543,4 +1629,4 @@ class MultiL1SNRDBLoss(torch.nn.Module):
         combined_loss = (1 - self.spec_weight) * time_loss + self.spec_weight * spec_loss
 
         # Apply overall weight
-        return combined_loss * self.weight
+        return _apply_grad_scale(combined_loss * self.weight, self.grad_scale)
