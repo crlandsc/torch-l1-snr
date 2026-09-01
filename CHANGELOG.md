@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-09-01)
 
 Two non-breaking follow-ups to 0.2.0 for tuning the losses. Neither changes the default output: float32 and
 float64 values are byte-identical, so D1 stays bit-exact to the authors' BandIt code.
